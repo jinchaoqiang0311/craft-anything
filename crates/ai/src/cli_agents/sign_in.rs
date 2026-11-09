@@ -54,7 +54,10 @@ fn agent_sign_in(_ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolEr
 /// the window after Craft Anything closes.
 #[cfg(windows)]
 fn open_window(agent: &'static KnownAgent, program: &Path, command: SignInCommand) -> Result<(&'static str, u32), ToolError> {
-    let script = std::env::temp_dir().join(format!("craft-sign-in-{}.cmd", agent.id));
+    // A name of its own (process id and time) so two clicks, or another program writing in the
+    // temp folder, can't swap the script this window is about to run.
+    let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    let script = std::env::temp_dir().join(format!("craft-sign-in-{}-{}-{millis}.cmd", agent.id, std::process::id()));
     fs::write_atomic(&script, script_text(agent, program, &command).as_bytes())?;
     match which::which("wt") {
         Some(wt) => {
@@ -64,13 +67,27 @@ fn open_window(agent: &'static KnownAgent, program: &Path, command: SignInComman
                 .label("Windows Terminal")
                 .remediation("Install Windows Terminal, or run the sign-in command in a terminal yourself.")
                 .detach()?;
+            remove_later(&script);
             Ok(("windows-terminal", pid))
         }
         None => {
             let pid = Launch::new("cmd.exe").arg("/k").arg(&script).label("cmd").remediation("Run the sign-in command in a terminal yourself.").detach()?;
+            remove_later(&script);
             Ok(("cmd", pid))
         }
     }
+}
+
+/// Removes the script shortly after its window started. `cmd` reads the batch file as it runs, so
+/// the removal is best effort: a window still reading it keeps the file, which is small and only
+/// left in the temp folder.
+#[cfg(windows)]
+fn remove_later(script: &Path) {
+    let script = script.to_path_buf();
+    let _ = std::thread::Builder::new().name("sign-in-script".into()).spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(15));
+        let _ = std::fs::remove_file(&script);
+    });
 }
 
 /// 待确认: the terminal programs and their flags on macOS and Linux aren't checked, so this isn't

@@ -2244,6 +2244,7 @@ mod sign_in_tests {
             version: None,
             status: craft_anything_ai::cli_agents::status(sign_in),
             sign_in,
+            can_run: craft_anything_ai::cli_agents::can_run(id),
             checked_at: Some(Instant::now()),
             stale: false,
         }

@@ -134,6 +134,7 @@ mod tests {
             version: None,
             status: craft_anything_ai::cli_agents::AgentStatus::Unverified,
             sign_in: craft_anything_ai::cli_agents::SignInState::Unknown,
+            can_run: craft_anything_ai::cli_agents::can_run(id),
             checked_at: None,
             stale: false,
         };

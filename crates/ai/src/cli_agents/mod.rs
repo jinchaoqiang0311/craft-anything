@@ -176,6 +176,9 @@ pub struct AgentInstall {
     pub version: Option<String>,
     pub status: AgentStatus,
     pub sign_in: SignInState,
+    /// Whether a run can drive it (an adapter exists). One found only for its status says no, so
+    /// every frontend (window, CLI, MCP) reads the same fact instead of checking the adapters.
+    pub can_run: bool,
     /// When the last sign-in answer arrived (not kept with the settings: it's about this run).
     #[serde(skip)]
     pub checked_at: Option<Instant>,
@@ -195,6 +198,7 @@ impl AgentInstall {
             version,
             status: status_of(sign_in),
             sign_in,
+            can_run: adapters::AgentAdapters::built_in().has_adapter(agent.id),
             checked_at: Some(Instant::now()),
             stale: false,
         }
@@ -417,32 +421,73 @@ const SIGN_IN_PROBE: Duration = Duration::from_millis(5000);
 const NETWORK_SIGN_IN_PROBE: Duration = Duration::from_secs(15);
 const AGENT_CACHE_TTL: Duration = Duration::from_secs(60);
 
+#[derive(Clone)]
 struct AgentCache {
     at: Instant,
     list: Vec<AgentInstall>,
+    /// When the answers that need the network were last read; `None` until a full scan ran.
+    slow_at: Option<Instant>,
 }
 
 /// The agents found on this computer, with version and sign-in state. One scan is cached for
 /// [`AGENT_CACHE_TTL`]; `refresh` scans now. `full` also runs sign-in queries that need the
-/// network (a launch keeps to the local ones). Only read-only queries run (`--version`, a status
-/// command); no login is ever started and no config is changed.
+/// network (a launch keeps to the local ones), and those answers are kept for the same
+/// [`AGENT_CACHE_TTL`], so showing the page again reuses them instead of starting every agent
+/// over. Only read-only queries run (`--version`, a status command); no login is ever started and
+/// no config is changed.
 pub fn installed(refresh: bool, full: bool) -> Vec<AgentInstall> {
     static CACHE: OnceLock<Mutex<Option<AgentCache>>> = OnceLock::new();
+    static SLOW: OnceLock<Mutex<()>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(None));
-    let mut guard = cache.lock().unwrap_or_else(PoisonError::into_inner);
-    guard.label("agent discovery");
-    if !refresh && let Some(cached) = guard.as_ref().filter(|c| c.at.elapsed() < AGENT_CACHE_TTL) {
-        let mut list = cached.list.clone();
-        if full {
-            // The second pass only fills sign-in state; paths and versions stay as scanned.
-            probe_slow_sign_ins(&mut list);
-            *guard = Some(AgentCache { at: Instant::now(), list: list.clone() });
+    // Take the last scan and let the lock go: filling the slow answers can take seconds, and a
+    // caller that only needs the list never waits behind it.
+    let snapshot = {
+        let guard = cache.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.label("agent discovery");
+        guard.as_ref().filter(|c| !refresh && c.at.elapsed() < AGENT_CACHE_TTL).cloned()
+    };
+    let mut list = match snapshot {
+        Some(cached) => cached.list,
+        None => {
+            let list = discover_agents(full);
+            let mut guard = cache.lock().unwrap_or_else(PoisonError::into_inner);
+            guard.label("agent discovery");
+            *guard = Some(AgentCache { at: Instant::now(), list: list.clone(), slow_at: full.then(Instant::now) });
+            list
         }
+    };
+    if !full {
         return list;
     }
-    let list = discover_agents(full);
-    *guard = Some(AgentCache { at: Instant::now(), list: list.clone() });
+    if slow_answers_fresh(cache) {
+        return cached_list(cache).unwrap_or(list);
+    }
+    // One slow round at a time: a second caller waits and then reuses its answers instead of
+    // starting the same agents again.
+    let slow = SLOW.get_or_init(|| Mutex::new(()));
+    let slow_guard = slow.lock().unwrap_or_else(PoisonError::into_inner);
+    slow_guard.label("agent sign-in probes");
+    if slow_answers_fresh(cache) {
+        return cached_list(cache).unwrap_or(list);
+    }
+    probe_slow_sign_ins(&mut list);
+    let mut guard = cache.lock().unwrap_or_else(PoisonError::into_inner);
+    guard.label("agent discovery");
+    *guard = Some(AgentCache { at: Instant::now(), list: list.clone(), slow_at: Some(Instant::now()) });
     list
+}
+
+/// Whether the last network answers are still worth reusing.
+fn slow_answers_fresh(cache: &Mutex<Option<AgentCache>>) -> bool {
+    let guard = cache.lock().unwrap_or_else(PoisonError::into_inner);
+    guard.label("agent discovery");
+    guard.as_ref().is_some_and(|c| c.slow_at.is_some_and(|at| at.elapsed() < AGENT_CACHE_TTL))
+}
+
+fn cached_list(cache: &Mutex<Option<AgentCache>>) -> Option<Vec<AgentInstall>> {
+    let guard = cache.lock().unwrap_or_else(PoisonError::into_inner);
+    guard.label("agent discovery");
+    guard.as_ref().map(|c| c.list.clone())
 }
 
 /// The quick scan a launch runs: local answers only.
