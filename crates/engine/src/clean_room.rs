@@ -46,6 +46,8 @@ pub const TOOLS: &[&str] = &[
     "assets_key_status",
     "ai_model_options_show",
     "ai_model_options_set",
+    // Opening the person's own coding agent's sign-in window; touches no target.
+    "agent_sign_in",
     // Projects and the rebuild run.
     "project_list",
     "project_show",

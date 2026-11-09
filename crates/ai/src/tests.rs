@@ -121,7 +121,9 @@ fn a_coding_agent_test_says_it_only_checked_the_version() {
 fn a_saved_program_that_is_gone_is_named_by_test_and_doctor() {
     let (h, _d) = hub();
     let dir = tempfile::tempdir().unwrap();
-    let gone = dir.path().join("old-build").join("agent").display().to_string();
+    // "old-agent" rather than "agent": `agent` is Cursor CLI's real program name, and a saved
+    // command with that name is read as that agent (config.rs `model_from_command`).
+    let gone = dir.path().join("old-build").join("old-agent").display().to_string();
     let backend = |name: &str, model: &str| BackendEntry {
         config: BackendConfig { name: name.into(), kind: BackendKind::AgentCli, model: model.into(), base_url: None, ssh_host: None, enabled: true },
         options: BackendOptions { command: Some(gone.clone()), ..Default::default() },
@@ -142,7 +144,7 @@ fn a_saved_program_that_is_gone_is_named_by_test_and_doctor() {
 #[test]
 fn every_agent_with_its_own_adapter_is_offered() {
     let adapters = cli_agents::adapters::AgentAdapters::built_in();
-    let own: Vec<&str> = cli_agents::KNOWN.iter().map(|(id, _, _)| *id).filter(|id| adapters.for_agent(id).ids().contains(id)).collect();
+    let own: Vec<&str> = cli_agents::KNOWN.iter().map(|a| a.id).filter(|id| adapters.for_agent(id).ids().contains(id)).collect();
     assert!(own.contains(&"maki"), "{own:?}");
     for id in own {
         assert!(BackendKind::AgentCli.suggested_models().contains(&id), "{id} isn't offered");
@@ -234,7 +236,9 @@ fn disabled_backends_are_refused_on_either_side_of_compare() {
 fn opencode_selection_is_validated_saved_and_run_natively_with_our_mcp_server() {
     use std::os::unix::fs::PermissionsExt;
     let (h, dir) = hub();
-    let program = dir.path().join("agent");
+    // Not "agent": that is Cursor CLI's program name, which `model_from_command` would take as
+    // the agent and rename the backend's model.
+    let program = dir.path().join("fake-agent");
     let catalogue = dir.path().join("models.json");
     let seen = dir.path().join("arguments.txt");
     let quote = |p: &std::path::Path| ssh::shell_quote(&p.display().to_string());
@@ -310,6 +314,22 @@ fn model_context_distinguishes_a_busy_session_from_no_project() {
     assert!(h.model_context("missing").is_err());
 }
 
+/// One choice is enough: an agent added in Settings builds and reads the original, and the
+/// latest one added wins. An API AI, or a disabled agent, changes no role.
+#[test]
+fn adding_an_agent_chooses_it_for_building_and_reading() {
+    let (h, _d) = hub();
+    add(&h, "Claude Code", BackendKind::AgentCli, "http://127.0.0.1:9", None);
+    assert_eq!((h.chosen(Role::Builder).as_deref(), h.chosen(Role::Extractor).as_deref()), (Some("Claude Code"), Some("Claude Code")));
+    add(&h, "Kimi K3.1 Pro (OpenRouter)", BackendKind::Openrouter, "http://127.0.0.1:9", Some("sk-test"));
+    assert_eq!((h.chosen(Role::Builder).as_deref(), h.chosen(Role::Extractor).as_deref()), (Some("Claude Code"), Some("Claude Code")));
+    add(&h, "Codex", BackendKind::AgentCli, "http://127.0.0.1:9", None);
+    assert_eq!((h.chosen(Role::Builder).as_deref(), h.chosen(Role::Extractor).as_deref()), (Some("Codex"), Some("Codex")));
+    let off = BackendConfig { name: "TraeCode".into(), kind: BackendKind::AgentCli, model: "traecli".into(), base_url: None, ssh_host: None, enabled: false };
+    h.add_backend(off, None).unwrap();
+    assert_eq!((h.chosen(Role::Builder).as_deref(), h.chosen(Role::Extractor).as_deref()), (Some("Codex"), Some("Codex")));
+}
+
 #[test]
 fn a_failed_save_changes_nothing() {
     let dir = tempfile::tempdir().unwrap();
@@ -359,12 +379,12 @@ fn the_person_chooses_who_builds() {
     let (h, _d) = hub();
     add(&h, "Claude Code", BackendKind::AgentCli, "http://127.0.0.1:9", None);
     add(&h, "Kimi K3.1 Pro (OpenRouter)", BackendKind::Openrouter, "http://127.0.0.1:9", Some("sk-test"));
-    assert_eq!(h.chosen(Role::Builder), None, "automatic until chosen");
+    // Adding an agent is choosing it (see `adding_an_agent_chooses_it_for_building_and_reading`);
+    // adding an API AI changes no role.
+    assert_eq!(h.chosen(Role::Builder).as_deref(), Some("Claude Code"));
     assert!(h.set_role(Role::Builder, Some("Nobody")).is_err(), "only a configured backend");
     h.set_role(Role::Builder, Some("Kimi K3.1 Pro (OpenRouter)")).unwrap();
     assert_eq!(h.chosen(Role::Builder).as_deref(), Some("Kimi K3.1 Pro (OpenRouter)"));
-    // The extractor is chosen the same way, and has no default.
-    assert_eq!(h.chosen(Role::Extractor), None);
     h.set_role(Role::Extractor, Some("Kimi K3.1 Pro (OpenRouter)")).unwrap();
     assert_eq!(h.chosen(Role::Extractor).as_deref(), Some("Kimi K3.1 Pro (OpenRouter)"));
     // A removed backend can't stay the builder.
@@ -417,7 +437,8 @@ fn a_switched_off_agent_is_found_again() {
     let (h, _d) = hub();
     add(&h, "Claude Code", BackendKind::AgentCli, "http://127.0.0.1:9", None);
     let saved = h.backends().into_iter().next().unwrap();
-    let found = |name: &str| Detected { suggestion: BackendConfig { name: name.into(), ..saved.clone() }, reason: "Found".into(), needs_key: false };
+    let found =
+        |name: &str| Detected { suggestion: BackendConfig { name: name.into(), ..saved.clone() }, reason: "Found".into(), needs_key: false, agent: None };
     let offered =
         |h: &AiHub| leave_out_set_up(vec![found("Claude Code"), found("Codex")], &h.backends()).into_iter().map(|d| d.suggestion.name).collect::<Vec<_>>();
     assert_eq!(offered(&h), ["Codex"], "on: Claude Code is set up, so it isn't offered");

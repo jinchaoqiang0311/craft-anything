@@ -219,17 +219,18 @@ impl BackendEntry {
     fn model_from_command(&mut self) {
         let known = crate::cli_agents::KNOWN;
         let model = self.config.model.trim();
-        let names_an_agent = known.iter().any(|(id, prog, display)| model == *id || model == *prog || model.eq_ignore_ascii_case(display));
+        let names_an_agent =
+            known.iter().any(|a| model == a.id || model.eq_ignore_ascii_case(a.display) || a.programs.iter().any(|p| p.eq_ignore_ascii_case(model)));
         if self.config.kind != BackendKind::AgentCli || model.is_empty() || names_an_agent {
             return;
         }
         // The file name without `.exe`, whichever system's separators the path uses.
         let program = self.options.command.as_deref().and_then(|c| c.trim().rsplit(['/', '\\']).next()).map(|f| f.strip_suffix(".exe").unwrap_or(f));
-        let Some((id, _, _)) = program.and_then(|p| known.iter().find(|(_, prog, _)| prog.eq_ignore_ascii_case(p))) else { return };
+        let Some(agent) = program.and_then(|p| known.iter().find(|a| a.programs.iter().any(|prog| prog.eq_ignore_ascii_case(p)))) else { return };
         if self.options.cli_model.is_none() {
             self.options.cli_model = Some(model.to_string());
         }
-        self.config.model = id.to_string();
+        self.config.model = agent.id.to_string();
     }
 }
 

@@ -7,20 +7,24 @@ use super::*;
 
 mod aider;
 mod antigravity;
+mod codebuddy;
 mod copilot;
 mod dsh;
 mod grok;
 mod hermes;
 mod maki;
 mod opencode;
+mod trae;
 pub use aider::Aider;
 pub use antigravity::Antigravity;
+pub use codebuddy::CodeBuddy;
 pub use copilot::Copilot;
 pub use dsh::DeepSeekHarness;
 pub use grok::Grok;
 pub use hermes::Hermes;
 pub use maki::Maki;
 pub use opencode::OpenCode;
+pub use trae::TraeCode;
 
 /// What a run's arguments are built from.
 pub struct ArgsCx<'a> {
@@ -131,6 +135,11 @@ pub trait AgentAdapter: Send + Sync {
     /// call off the UI thread. Empty means this agent offers no choices.
     fn model_choices(&self, _config: &BackendConfig, _options: &BackendOptions) -> Result<Vec<String>, ToolError> {
         Ok(Vec::new())
+    }
+    /// Where that list came from, in a sentence to show beside the picker: the CLI that named it,
+    /// or why it named none. `None`: the list itself says enough.
+    fn model_choices_note(&self, _models: &[String]) -> Option<String> {
+        None
     }
     /// Whether this adapter offers context and reasoning controls beyond the model selector.
     fn supports_model_tuning(&self) -> bool {
@@ -277,6 +286,8 @@ impl AgentAdapters {
                 Arc::new(Copilot),
                 Arc::new(Grok),
                 Arc::new(DeepSeekHarness),
+                Arc::new(CodeBuddy::default()),
+                Arc::new(TraeCode),
             ],
         }
     }
@@ -290,6 +301,12 @@ impl AgentAdapters {
     /// The adapter for an agent id; one it doesn't know gets the plain adapter.
     pub fn for_agent(&self, agent: &str) -> Arc<dyn AgentAdapter> {
         self.adapters.iter().find(|a| a.ids().contains(&agent)).cloned().unwrap_or_else(|| Arc::new(Plain))
+    }
+
+    /// Whether a registered adapter drives this agent id. The plain fallback doesn't count: an agent
+    /// without one can be found and asked about, but can't be chosen to build or read yet.
+    pub fn has_adapter(&self, agent: &str) -> bool {
+        self.adapters.iter().any(|a| a.ids().contains(&agent))
     }
 
     /// The adapter for an agent with a backend's options: in the folder they choose for it, when

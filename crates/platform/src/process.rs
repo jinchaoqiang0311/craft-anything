@@ -273,6 +273,13 @@ impl Process {
     pub fn spawn(self) -> Result<RunningProcess, ToolError> {
         let name = self.display();
         let (program, lead) = crate::which::launch_target(&self.program);
+        // A file merely named `.exe` (npm's batch placeholder) would make Windows show its
+        // "16-bit application" dialog and block the desktop; refuse it as a missing program.
+        #[cfg(windows)]
+        if crate::which::not_a_program(std::path::Path::new(&program)) {
+            return Err(ToolError::new(ErrorCode::EngineMissing, format!("{name} is not a Windows program."))
+                .with_remediation(format!("Reinstall {name}: the file at that path is a package placeholder, not the program itself.")));
+        }
         let mut wrap = CommandWrap::with_new(&program, |cmd| {
             cmd.args(&lead).args(&self.args);
             if self.env_clear {
@@ -952,6 +959,40 @@ impl Launch {
     /// Start the program and return at once; returns its process id.
     pub fn start(self) -> Result<u32, ToolError> {
         self.start_watched().map(|l| l.pid())
+    }
+
+    /// Start the program in a window of its own and let go of it: no job object or process group
+    /// ties it to us, so it keeps running after Craft Anything closes (a sign-in terminal). We
+    /// never wait for it, and a missing program is still a [`ToolError`].
+    pub fn detach(self) -> Result<u32, ToolError> {
+        let name = self.display();
+        let mut cmd = std::process::Command::new(&self.program);
+        cmd.args(&self.args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        use_search_path(&mut cmd);
+        if let Some(dir) = &self.cwd {
+            cmd.current_dir(dir);
+        }
+        // A console program started from the desktop app (which has no console) gets a window;
+        // asking for a new console makes that true even when a CLI run already has one.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+            cmd.creation_flags(CREATE_NEW_CONSOLE);
+        }
+        let child = cmd.spawn().map_err(|e| spawn_error(&name, &self.program, self.cwd.as_deref(), e, self.remediation.as_deref()))?;
+        let pid = child.id();
+        #[cfg(unix)]
+        {
+            // The child is ours to reap; wait on it off the UI thread (we never block on it).
+            let _ = std::thread::Builder::new().name(format!("detached-{name}")).spawn(move || {
+                let mut child = child;
+                let _ = child.wait();
+            });
+        }
+        #[cfg(windows)]
+        drop(child);
+        Ok(pid)
     }
 
     /// Start the program and return at once, with a handle that tells when it ends and can stop

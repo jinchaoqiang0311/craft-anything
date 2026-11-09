@@ -31,6 +31,12 @@ pub enum AiCommand {
     List,
     /// Look for keys, local servers, agent CLIs and SSH hosts.
     Detect,
+    /// Coding agents installed on this computer, with program, version and sign-in state.
+    Agents {
+        /// Scan again instead of using the cached result.
+        #[arg(long)]
+        refresh: bool,
+    },
     /// Add a backend.
     Add {
         name: String,
@@ -221,6 +227,10 @@ pub fn ai(cli: &Cli, c: &AiCommand, f: Format) -> u8 {
                 })
                 .collect();
             emit(&Value::Array(v), f);
+            0
+        }
+        AiCommand::Agents { refresh } => {
+            emit(&serde_json::to_value(hub.agents(*refresh)).unwrap_or(Value::Null), f);
             0
         }
         AiCommand::Detect => {

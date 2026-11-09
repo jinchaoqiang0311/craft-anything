@@ -277,13 +277,20 @@ fn pick_renderer(config: &std::path::Path, last_failed: bool) -> Option<renderer
         return None;
     }
     let version = env!("CARGO_PKG_VERSION");
-    let chosen = renderer::choose(renderer::remembered(config, version), last_failed);
+    let remembered = renderer::remembered(config, version);
+    let chosen = renderer::decide(remembered, last_failed, renderer::card_renderer);
     renderer::remember(config, version, chosen);
     RETRY_IN_SOFTWARE.store(chosen.software(), Ordering::Relaxed);
     if last_failed {
         log::warn!("drawing with {} ({}), after a start that never opened its window", chosen.title(), chosen.name());
     } else if chosen != renderer::Renderer::Dx12 {
-        log::info!("drawing with {} ({}), which opened the window last time", chosen.title(), chosen.name());
+        // Only a start that was going to draw with DX12 asks which backend has a card, and DX12 is
+        // not what it chose, so DX12 here has only Windows' software renderer.
+        if remembered.is_none_or(|r| r == renderer::Renderer::Dx12) {
+            log::info!("DX12 has no graphics card here, only its software renderer; drawing with {} ({})", chosen.title(), chosen.name());
+        } else {
+            log::info!("drawing with {} ({}), which opened the window last time", chosen.title(), chosen.name());
+        }
     }
     Some(chosen)
 }

@@ -56,6 +56,65 @@ pub fn bar(ui: &mut egui::Ui, chosen: &mut Option<DetectTab>, detected: &[Detect
     showing
 }
 
+/// Whether a found agent can be chosen to build and read. The rest (Kimi Code, Cursor CLI, Qoder
+/// CLI for now) are shown so they're found and their sign-in state read, but adding one would only
+/// make a backend that can't work, so no button offers it.
+pub fn runnable(d: &Detected) -> bool {
+    d.agent.as_ref().is_none_or(|a| craft_anything_ai::cli_agents::can_run(&a.id))
+}
+
+/// A found agent's sign-in state, version and program, from its typed [`AgentInstall`], so the
+/// card never reshapes data into a sentence somewhere else. Returns whether the person clicked
+/// "Sign in" (a click, never automatic: the login tool runs only from here).
+pub fn agent_detail(ui: &mut egui::Ui, agent: &craft_anything_ai::cli_agents::AgentInstall) -> bool {
+    use craft_anything_ai::cli_agents::AgentStatus;
+    let t = crate::theme::Tokens::get(ui.ctx());
+    let (status, color) = match agent.status {
+        AgentStatus::Ready => (crate::i18n::tr("Ready"), t.success),
+        AgentStatus::NeedsSignIn => (crate::i18n::tr("Needs sign-in"), t.warning),
+        AgentStatus::Unverified => (crate::i18n::tr("Sign-in not checked"), t.text_faint),
+    };
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new(status).color(color).size(crate::theme::CAPTION));
+        if agent.stale {
+            let when = agent
+                .checked_at
+                .map(|t| {
+                    let minutes = t.elapsed().as_secs() / 60;
+                    if minutes == 0 { "just now".to_string() } else { format!("{minutes} min ago") }
+                })
+                .unwrap_or_else(|| "earlier".to_string());
+            ui.label(
+                egui::RichText::new(crate::i18n::trf("Couldn't check just now; last known {when}.", &[("when", when.as_str())]))
+                    .color(t.warning)
+                    .size(crate::theme::CAPTION),
+            );
+        }
+        if let Some(version) = &agent.version {
+            ui.label(egui::RichText::new(format!("v{version}")).color(t.text_faint).size(crate::theme::CAPTION));
+        }
+        ui.label(egui::RichText::new(agent.program.display().to_string()).color(t.text_faint).size(crate::theme::CAPTION));
+    });
+    let mut clicked = false;
+    if !craft_anything_ai::cli_agents::can_run(&agent.id) {
+        ui.label(
+            egui::RichText::new(crate::i18n::tr(
+                "Can't build or read yet: this version finds it and shows whether it's signed in, but it can't be chosen as a backend.",
+            ))
+            .color(t.text_dim)
+            .size(crate::theme::CAPTION),
+        );
+    }
+    if agent.status == AgentStatus::NeedsSignIn {
+        if craft_anything_ai::cli_agents::can_sign_in(&agent.id) {
+            clicked = ui.link(crate::i18n::tr("Sign in")).clicked();
+        } else {
+            ui.label(egui::RichText::new(crate::i18n::tr("Sign in to it once in a terminal, then look again.")).color(t.text_dim).size(crate::theme::CAPTION));
+        }
+    }
+    clicked
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,7 +122,37 @@ mod tests {
 
     fn detected(kind: BackendKind) -> Detected {
         let suggestion = BackendConfig { name: "X".into(), kind, model: "m".into(), base_url: None, ssh_host: None, enabled: true };
-        Detected { suggestion, reason: String::new(), needs_key: false }
+        Detected { suggestion, reason: String::new(), needs_key: false, agent: None }
+    }
+
+    fn found_agent(id: &str) -> Detected {
+        let agent = craft_anything_ai::cli_agents::AgentInstall {
+            id: id.into(),
+            display: id.into(),
+            program: "prog".into(),
+            source: craft_anything_ai::cli_agents::InstallSource::Path,
+            version: None,
+            status: craft_anything_ai::cli_agents::AgentStatus::Unverified,
+            sign_in: craft_anything_ai::cli_agents::SignInState::Unknown,
+            checked_at: None,
+            stale: false,
+        };
+        Detected {
+            suggestion: BackendConfig { name: id.into(), kind: BackendKind::AgentCli, model: id.into(), base_url: None, ssh_host: None, enabled: true },
+            reason: String::new(),
+            needs_key: false,
+            agent: Some(agent),
+        }
+    }
+
+    /// Only agents a run adapter drives may be added: the status-only ones get no button.
+    #[test]
+    fn only_agents_that_can_run_are_offered_as_backends() {
+        assert!(runnable(&found_agent("claude-code")));
+        assert!(!runnable(&found_agent("kimi-code")));
+        assert!(!runnable(&found_agent("cursor-cli")));
+        assert!(!runnable(&found_agent("qoder-cli")));
+        assert!(runnable(&detected(BackendKind::Anthropic)), "a provider isn't an agent at all");
     }
 
     /// An agent app is a harness; an API backend and a local server are providers.

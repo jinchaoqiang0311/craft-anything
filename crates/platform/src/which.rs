@@ -57,6 +57,9 @@ pub(crate) fn launch_target(program: &std::ffi::OsStr) -> (OsString, Vec<OsStrin
     // Started by the path it was found at, not by name: a child with a cleared environment, or a
     // lookup that differs from ours, would say "not found" for a program that is there (#152).
     let Some(found) = which_in(&program.to_string_lossy(), path.clone()).into_iter().next() else { return (program.to_owned(), Vec::new()) };
+    // npm writes a batch placeholder named `.exe` when its native binary didn't install; the shim
+    // beside it is the program people mean.
+    let found = if not_a_program(&found) { sibling_shim(&found).unwrap_or(found) } else { found };
     match read_shim(&found) {
         Some((dir, None, target)) if is_executable(&dir.join(&target)) => (dir.join(target).into_os_string(), Vec::new()),
         Some((dir, Some(interpreter), target)) if dir.join(&target).is_file() => match find_interpreter(&dir, &interpreter, path) {
@@ -65,6 +68,27 @@ pub(crate) fn launch_target(program: &std::ffi::OsStr) -> (OsString, Vec<OsStrin
         },
         _ => (found.into_os_string(), Vec::new()),
     }
+}
+
+/// Whether a file named `.exe` is not a Windows program image. npm leaves a batch script under
+/// that name when its native binary didn't download, and starting it makes Windows show its
+/// "16-bit application" dialog instead of running anything.
+#[cfg(windows)]
+pub(crate) fn not_a_program(path: &Path) -> bool {
+    if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")) {
+        return false;
+    }
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else { return false };
+    let mut head = [0u8; 2];
+    !matches!(file.read(&mut head), Ok(2) if head == *b"MZ")
+}
+
+/// A `.cmd` or `.bat` beside the file, for a placeholder that has a working shim next to it.
+#[cfg(windows)]
+fn sibling_shim(exe: &Path) -> Option<PathBuf> {
+    let stem = exe.file_stem()?.to_string_lossy().into_owned();
+    ["cmd", "bat"].into_iter().map(|ext| exe.with_file_name(format!("{stem}.{ext}"))).find(|p| p.is_file())
 }
 
 #[cfg(not(windows))]
@@ -322,6 +346,26 @@ mod tests {
         assert!(which("sh").is_some());
         assert!(which("definitely-not-a-program-xyz").is_none());
         assert!(which("").is_none());
+    }
+
+    /// npm's batch file named `.exe` is not a program: starting it shows Windows' "16-bit
+    /// application" dialog. The `.cmd` beside it is what people mean, and a real image is left alone.
+    #[cfg(windows)]
+    #[test]
+    fn an_npm_placeholder_exe_is_recognised_and_its_shim_preferred() {
+        let dir = tempfile::tempdir().unwrap();
+        let placeholder = dir.path().join("claude.exe");
+        std::fs::write(&placeholder, b"echo \"Error: native binary not installed.\"\n").unwrap();
+        assert!(not_a_program(&placeholder));
+        assert_eq!(sibling_shim(&placeholder), None, "nothing else to start");
+        let shim = dir.path().join("claude.cmd");
+        std::fs::write(&shim, "@echo off\nnode \"%~dp0cli.js\" %*\n").unwrap();
+        assert_eq!(sibling_shim(&placeholder), Some(shim.clone()));
+        let real = dir.path().join("real.exe");
+        std::fs::write(&real, b"MZ\x90\x00").unwrap();
+        assert!(!not_a_program(&real));
+        assert!(!not_a_program(&shim), "a batch file is started by its own rules");
+        assert!(!not_a_program(&dir.path().join("missing.exe")));
     }
 
     #[cfg(unix)]

@@ -50,7 +50,7 @@ use craft_anything_engine::evidence::{ErrorCode, Evidence, ToolError, Unknown};
 use craft_anything_engine::{CallOptions, Caller, Consent, Engine, Mode, Settings, TargetKind, ToolOutput, clean_room};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use state::{CenterTab, ChatItem, ConsentAnswer, Fill, RailKind, Screen, UiState};
+use state::{CenterTab, ChatItem, ConsentAnswer, Fill, RailKind, Screen, SettingsTab, UiState};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -157,6 +157,13 @@ pub enum Done {
     },
     /// What a scan found, and why an expected coding agent may be missing.
     Detected(Vec<Detected>, Vec<craft_anything_ai::detect::DetectHint>),
+    /// Version and sign-in answers for the agents a scan found (the slower second pass).
+    AgentsProbed(Vec<craft_anything_ai::cli_agents::AgentInstall>),
+    /// Sign-in answers read again while Settings → AI is on screen (`network` says which pass).
+    AgentSignIn {
+        states: Vec<(String, craft_anything_ai::cli_agents::SignInState)>,
+        network: bool,
+    },
     /// The configured backends, the ones chosen to build with and to extract with, and each one's
     /// options.
     Backends(Vec<BackendConfig>, Option<String>, Option<String>, std::collections::BTreeMap<String, craft_anything_ai::BackendOptions>),
@@ -409,9 +416,52 @@ const LEDGER_VIEW_CAP: usize = 300;
 /// Frames that must have been shown before [`CraftApp::after_first_frames`] runs its callback.
 const FIRST_FRAMES: u32 = 2;
 
+/// How often Settings → AI re-reads the found agents' sign-in state while it is on screen.
+const SIGN_IN_ROUND: Duration = Duration::from_secs(60);
+
+/// Whether a sign-in round is due: the first time the page is shown, then every [`SIGN_IN_ROUND`].
+fn sign_in_round_due(visible: bool, now: Instant, last: Option<Instant>) -> bool {
+    visible && last.is_none_or(|at| now.saturating_duration_since(at) >= SIGN_IN_ROUND)
+}
+
+/// Puts answers into the agent rows in place (never reordering): an answer updates the state;
+/// no answer (timeout, a busy program) keeps the last known state and marks it stale, so a
+/// signed-in person is never shown as signed out. Agents without a check in this pass are left
+/// alone.
+fn apply_sign_in_rows(
+    rows: &mut [craft_anything_ai::cli_agents::AgentInstall],
+    answers: &[(String, craft_anything_ai::cli_agents::SignInState)],
+    network: bool,
+    now: Instant,
+) {
+    for row in rows.iter_mut() {
+        if !craft_anything_ai::cli_agents::sign_in_checked(&row.id, network) {
+            continue;
+        }
+        match answers.iter().find(|(id, _)| id == &row.id) {
+            Some((_, state)) => {
+                row.sign_in = *state;
+                row.status = craft_anything_ai::cli_agents::status(*state);
+                row.checked_at = Some(now);
+                row.stale = false;
+            }
+            None => row.stale = true,
+        }
+    }
+}
+
 struct FirstFrames {
     drawn: u32,
     done: Box<dyn FnOnce() + Send>,
+}
+
+/// Settings → AI's sign-in refresh: when the last round started, and which pass is still running
+/// (a round never stacks on one that hasn't finished).
+#[derive(Debug, Clone, Default)]
+struct SignInRefresh {
+    last_round: Option<Instant>,
+    local_running: bool,
+    network_running: bool,
 }
 
 pub struct CraftApp {
@@ -450,6 +500,10 @@ pub struct CraftApp {
     /// The backend chosen to take a game's files out in Deep mode, if any.
     pub extractor: Option<String>,
     pub detected: Option<Vec<Detected>>,
+    /// The last full sign-in answers, kept so they survive a scan that lands after them.
+    probed_agents: Option<Vec<craft_anything_ai::cli_agents::AgentInstall>>,
+    /// The 60-second sign-in refresh while Settings → AI is on screen.
+    sign_in_refresh: SignInRefresh,
     /// Why an expected coding agent may be missing, from the last scan.
     pub detect_hints: Vec<craft_anything_ai::detect::DetectHint>,
     pub detecting: bool,
@@ -570,6 +624,8 @@ impl CraftApp {
             builder: None,
             extractor: None,
             detected: None,
+            probed_agents: None,
+            sign_in_refresh: SignInRefresh::default(),
             detect_hints: Vec::new(),
             detecting: false,
             backend_choices: 0,
@@ -1012,6 +1068,11 @@ impl CraftApp {
                 }
             }
             ("project_open_folder", Err(e)) => self.toast(format!("{} {}", tr("Couldn't open the folder."), e.message), true),
+            ("agent_sign_in", Ok(v)) => {
+                let window = if v["terminal"].as_str() == Some("windows-terminal") { "Windows Terminal" } else { "a terminal" };
+                self.toast(i18n::trf("A {window} window is open to sign in. This list updates within a minute.", &[("window", window)]), false);
+            }
+            ("agent_sign_in", Err(e)) => self.toast(format!("{} {}", tr("Couldn't open a sign-in window."), e.for_people()), true),
             (
                 "game_archives_list"
                 | "game_pak_list"
@@ -1201,12 +1262,27 @@ impl CraftApp {
         });
     }
 
+    /// Copies probed version and sign-in state into the rows already on screen, by id.
+    fn merge_agent_status(&mut self, probed: &[craft_anything_ai::cli_agents::AgentInstall]) {
+        let Some(detected) = self.detected.as_mut() else { return };
+        for row in detected.iter_mut() {
+            let Some(agent) = row.agent.as_mut() else { continue };
+            if let Some(fresh) = probed.iter().find(|p| p.id == agent.id) {
+                *agent = fresh.clone();
+            }
+        }
+    }
+
     pub fn detect_backends(&mut self) {
         if self.detecting {
             return;
         }
         self.detecting = true;
         let hub = self.hub.clone();
+        // Two passes: the quick list lands first (paths and versions), then the slower sign-in
+        // answers fill its agent rows in. The sign-in pass starts when the list arrives: both
+        // use one discovery cache, and starting them together made the slower one wait on the
+        // other's scan, which is exactly how the agent rows were being lost.
         self.jobs.spawn("Look for AI on this computer", true, move |_| Ok(Done::Detected(hub.detect(), hub.detect_hints())));
     }
 
@@ -1473,6 +1549,23 @@ impl CraftApp {
                 self.detecting = false;
                 self.log(false, format!("Found {} AI option(s) on this computer", d.len()));
                 self.detected = Some(d);
+                if let Some(probed) = self.probed_agents.clone() {
+                    self.merge_agent_status(&probed);
+                }
+                let hub = self.hub.clone();
+                self.jobs.spawn("Check agent sign-in", false, move |_| Ok(Done::AgentsProbed(hub.agents(false))));
+            }
+            Done::AgentsProbed(agents) => {
+                self.probed_agents = Some(agents.clone());
+                self.merge_agent_status(&agents);
+            }
+            Done::AgentSignIn { states, network } => {
+                if network {
+                    self.sign_in_refresh.network_running = false;
+                } else {
+                    self.sign_in_refresh.local_running = false;
+                }
+                self.apply_sign_in(&states, network);
             }
             Done::Backends(b, builder, extractor, options) => {
                 if self.state.backend.as_ref().is_some_and(|n| !b.iter().any(|c| &c.name == n)) {
@@ -1706,9 +1799,9 @@ impl CraftApp {
                 self.refresh_projects();
                 self.refresh_game_engines();
                 self.check_asset_keys();
-                if !self.settings.first_run_done {
-                    self.detect_backends();
-                }
+                // One bounded scan per launch, off the UI thread, so installed agents are listed
+                // as soon as the window opens.
+                self.detect_backends();
             }
         }
         let want = (self.theme_kind(), self.beginner());
@@ -1741,6 +1834,7 @@ impl CraftApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Informational));
         }
         self.refresh_view();
+        self.refresh_sign_ins(ctx);
         // A conversation and jobs are checked on a timer; runs repaint the window themselves
         // (`RunOptions::wake`), so only a slow check covers them.
         if self.conversation.as_ref().is_some_and(|c| c.is_busy()) || self.jobs.busy() {
@@ -1759,6 +1853,63 @@ impl CraftApp {
                     self.open_path(p);
                 }
             }
+        }
+    }
+
+    /// While Settings → AI is on screen, re-read the found agents' sign-in state every 60 s: the
+    /// local checks on one worker, the network ones on another, so a slow account service never
+    /// holds the rest. Nothing runs while the page is closed, the window is minimized, or in a
+    /// headless run (CLI/MCP).
+    fn refresh_sign_ins(&mut self, ctx: &egui::Context) {
+        if self.headless {
+            return;
+        }
+        let visible = self.state.settings_open && self.state.settings_tab == SettingsTab::Ai && !ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+        if !visible {
+            return;
+        }
+        let now = Instant::now();
+        if !sign_in_round_due(true, now, self.sign_in_refresh.last_round) {
+            if let Some(last) = self.sign_in_refresh.last_round {
+                ctx.request_repaint_after(SIGN_IN_ROUND.saturating_sub(last.elapsed()).max(Duration::from_millis(250)));
+            }
+            return;
+        }
+        let Some(rows) = self.detected.as_ref() else { return };
+        let list: Vec<craft_anything_ai::cli_agents::AgentInstall> = rows.iter().filter_map(|row| row.agent.clone()).collect();
+        if list.is_empty() {
+            return;
+        }
+        self.sign_in_refresh.last_round = Some(now);
+        if !self.sign_in_refresh.local_running {
+            self.sign_in_refresh.local_running = true;
+            let local = list.clone();
+            self.jobs.spawn("Check agent sign-in", false, move |_| {
+                Ok(Done::AgentSignIn { states: craft_anything_ai::cli_agents::sign_in_states(&local, false), network: false })
+            });
+        }
+        if !self.sign_in_refresh.network_running {
+            self.sign_in_refresh.network_running = true;
+            self.jobs.spawn("Check agent sign-in (online)", false, move |_| {
+                Ok(Done::AgentSignIn { states: craft_anything_ai::cli_agents::sign_in_states(&list, true), network: true })
+            });
+        }
+        ctx.request_repaint_after(SIGN_IN_ROUND);
+    }
+
+    /// Applies refreshed sign-in answers to the rows in place (the order and the scroll position
+    /// stay as they are), in the screen's list and in the scrollback a later scan merges from.
+    fn apply_sign_in(&mut self, answers: &[(String, craft_anything_ai::cli_agents::SignInState)], network: bool) {
+        let now = Instant::now();
+        if let Some(rows) = self.detected.as_mut() {
+            for row in rows.iter_mut() {
+                if let Some(agent) = row.agent.as_mut() {
+                    apply_sign_in_rows(std::slice::from_mut(agent), answers, network, now);
+                }
+            }
+        }
+        if let Some(agents) = self.probed_agents.as_mut() {
+            apply_sign_in_rows(agents.as_mut_slice(), answers, network, now);
         }
     }
 
@@ -2076,5 +2227,55 @@ pub fn kind_icon(k: TargetKind) -> &'static str {
         TargetKind::Evm => "zap",
         TargetKind::Sqlite => "database",
         TargetKind::Unknown => "file",
+    }
+}
+
+#[cfg(test)]
+mod sign_in_tests {
+    use super::*;
+    use craft_anything_ai::cli_agents::{AgentInstall, AgentStatus, InstallSource, SignInState};
+
+    fn row(id: &str, sign_in: SignInState) -> AgentInstall {
+        AgentInstall {
+            id: id.to_string(),
+            display: id.to_string(),
+            program: PathBuf::from(format!("{id}.exe")),
+            source: InstallSource::Path,
+            version: None,
+            status: craft_anything_ai::cli_agents::status(sign_in),
+            sign_in,
+            checked_at: Some(Instant::now()),
+            stale: false,
+        }
+    }
+
+    #[test]
+    fn a_round_runs_on_the_first_show_then_every_minute_and_only_when_visible() {
+        let start = Instant::now();
+        assert!(sign_in_round_due(true, start, None), "the first show asks at once");
+        assert!(!sign_in_round_due(false, start, None), "nothing while the page is closed");
+        assert!(!sign_in_round_due(true, start, Some(start)));
+        assert!(!sign_in_round_due(true, start + Duration::from_secs(59), Some(start)));
+        assert!(sign_in_round_due(true, start + Duration::from_secs(60), Some(start)));
+    }
+
+    #[test]
+    fn a_failed_check_keeps_the_last_state_and_a_new_answer_clears_it() {
+        let mut rows = vec![row("claude-code", SignInState::SignedIn), row("codebuddy", SignInState::SignedOut)];
+        let now = Instant::now();
+        // The local pass answers Claude but CodeBuddy's network query wasn't part of it.
+        apply_sign_in_rows(&mut rows, &[("claude-code".into(), SignInState::SignedOut)], false, now);
+        assert_eq!((rows[0].sign_in, rows[0].status), (SignInState::SignedOut, AgentStatus::NeedsSignIn));
+        assert!(!rows[0].stale);
+        assert!(!rows[1].stale, "a network agent is left alone by the local pass");
+        // The next local check times out: Claude keeps "signed out" (never flipped to signed in
+        // by a failure) and is marked stale; the row order doesn't change.
+        apply_sign_in_rows(&mut rows, &[], false, now);
+        assert_eq!(rows[0].sign_in, SignInState::SignedOut);
+        assert!(rows[0].stale, "a timeout shows as stale, not as a new state");
+        // A later answer clears the mark.
+        apply_sign_in_rows(&mut rows, &[("claude-code".into(), SignInState::SignedIn)], false, now);
+        assert_eq!((rows[0].sign_in, rows[0].status, rows[0].stale), (SignInState::SignedIn, AgentStatus::Ready, false));
+        assert_eq!(rows[1].id, "codebuddy", "rows stay where they were");
     }
 }

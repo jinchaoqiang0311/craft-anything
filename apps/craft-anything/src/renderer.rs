@@ -12,6 +12,13 @@
 //! catches. Vulkan and OpenGL come last because loading their drivers is what crashed some Intel
 //! systems before any window (#196, #394): they are reached only once DX12 has failed.
 //!
+//! DX12 has no graphics card on some systems: it offers only Windows' software renderer (WARP),
+//! which draws on the CPU. There a frame took about 480 ms on the machine this was measured on,
+//! against about 55 ms through OpenGL on the same card, so a start that would land on WARP asks
+//! which backend has a card instead and takes it once. The card is looked for in the chain's own
+//! order, and DX12 is asked first: on a system with a DX12 card no Vulkan or OpenGL driver is ever
+//! loaded. A card start that never opens its window goes back to WARP for this version.
+//!
 //! The choice is kept for this app version only: an update starts from DX12 again, so a system that
 //! was fixed meanwhile is back on the fast way. `WGPU_BACKEND` and `CRAFT_ANYTHING_RENDERER` still
 //! decide when set, and then nothing here is used.
@@ -92,6 +99,42 @@ pub fn choose(remembered: Option<Renderer>, last_start_failed: bool) -> Renderer
     if last_start_failed { current.next().unwrap_or(Renderer::Dx12) } else { current }
 }
 
+/// The renderer for this start, as [`choose`] gives it, with one correction: when it would be DX12
+/// and DX12 has only Windows' software renderer, a backend that has a graphics card draws instead
+/// (`card` says which, if any). OpenGL was the card attempt and never opened its window: the start
+/// after that stays on WARP rather than going round the chain to it again. `card` is asked only
+/// when it matters, so a start that already knows its renderer loads no other driver.
+pub fn decide(remembered: Option<Renderer>, last_start_failed: bool, card: impl FnOnce() -> Option<Renderer>) -> Renderer {
+    if last_start_failed && remembered == Some(Renderer::Gl) {
+        return Renderer::Warp;
+    }
+    let chosen = choose(remembered, last_start_failed);
+    if !last_start_failed && chosen == Renderer::Dx12 { card().unwrap_or(Renderer::Dx12) } else { chosen }
+}
+
+/// The backend that draws this window on a graphics card, in the chain's order, or `None` when only
+/// software can draw. DX12 is asked first: a card there means no Vulkan or OpenGL driver is loaded
+/// (see the module's note on #196 and #394).
+#[cfg(windows)]
+pub fn card_renderer() -> Option<Renderer> {
+    [Renderer::Dx12, Renderer::Vulkan, Renderer::Gl].into_iter().find(|r| draws_on_a_card(*r))
+}
+
+/// Whether that backend offers a device that isn't the software renderer. Any trouble finding out
+/// (a driver that won't load, or a panic inside wgpu) means no, so the start keeps the way that
+/// works.
+#[cfg(windows)]
+fn draws_on_a_card(renderer: Renderer) -> bool {
+    // wgpu asks the driver here, and a misbehaving one can panic inside it.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let descriptor = eframe::wgpu::InstanceDescriptor { backends: renderer.backends(), ..eframe::wgpu::InstanceDescriptor::new_without_display_handle() };
+        let instance = eframe::wgpu::Instance::new(descriptor);
+        let adapters = pollster::block_on(instance.enumerate_adapters(renderer.backends()));
+        adapters.iter().any(|a| a.get_info().device_type != eframe::wgpu::DeviceType::Cpu)
+    }))
+    .unwrap_or(false)
+}
+
 /// Whether a start that failed before its window should start again at once with the next
 /// renderer, and which: only when wgpu said what went wrong (any other early bug isn't the
 /// renderer's fault, and the next start moves on anyway), and only while there is a next one, so
@@ -147,6 +190,23 @@ mod tests {
         assert_eq!(choose(Some(Renderer::Vulkan), true), Renderer::Gl);
         assert_eq!(choose(Some(Renderer::Gl), true), Renderer::Dx12, "after the last, start over");
         assert_eq!(choose(Some(Renderer::Vulkan), false), Renderer::Vulkan, "one that worked is kept");
+    }
+
+    /// DX12 with only WARP draws on the CPU and is several times slower: a card through another
+    /// backend draws instead, once, and a start that never opens its window stays on WARP.
+    #[test]
+    fn a_card_draws_instead_of_windows_software_renderer() {
+        assert_eq!(decide(None, false, || Some(Renderer::Gl)), Renderer::Gl, "DX12 has no card: OpenGL draws");
+        assert_eq!(decide(Some(Renderer::Dx12), false, || Some(Renderer::Vulkan)), Renderer::Vulkan);
+        assert_eq!(decide(None, false, || None), Renderer::Dx12, "only software on this system: the usual way");
+        assert_eq!(decide(None, false, || Some(Renderer::Dx12)), Renderer::Dx12, "a DX12 card is the usual way");
+    }
+
+    #[test]
+    fn a_card_start_that_never_opened_its_window_stays_on_software() {
+        assert_eq!(decide(Some(Renderer::Gl), true, || Some(Renderer::Gl)), Renderer::Warp, "not round to OpenGL again");
+        assert_eq!(decide(Some(Renderer::Dx12), true, || Some(Renderer::Gl)), Renderer::Warp, "the chain's next after a failed DX12");
+        assert_eq!(decide(Some(Renderer::Warp), true, || Some(Renderer::Gl)), Renderer::Vulkan, "the chain still moves on");
     }
 
     #[test]

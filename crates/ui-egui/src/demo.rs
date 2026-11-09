@@ -203,13 +203,20 @@ pub fn detected() -> Vec<Detected> {
             suggestion: cfg("Claude Code", BackendKind::AgentCli, "claude-code"),
             reason: "Found the claude command on this computer.".into(),
             needs_key: false,
+            agent: None,
         },
         Detected {
             suggestion: cfg("Ollama", BackendKind::OpenaiCompatible, "llama3.2"),
             reason: "Found Ollama running with 3 models.".into(),
             needs_key: false,
+            agent: None,
         },
-        Detected { suggestion: cfg("OpenRouter", BackendKind::Openrouter, "auto"), reason: "Use any model through one key.".into(), needs_key: true },
+        Detected {
+            suggestion: cfg("OpenRouter", BackendKind::Openrouter, "auto"),
+            reason: "Use any model through one key.".into(),
+            needs_key: true,
+            agent: None,
+        },
     ]
 }
 

@@ -12,6 +12,7 @@ pub mod acp;
 pub mod adapters;
 pub mod models;
 mod shared;
+pub mod sign_in;
 
 pub(crate) use shared::SharedConversation;
 
@@ -30,32 +31,786 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, PoisonError};
-use std::time::Duration;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
 /// Name our MCP server is registered under.
 pub const MCP_NAME: &str = "craft-anything";
 
-/// Known agent CLIs: (agent id, program, display name).
-pub const KNOWN: &[(&str, &str, &str)] = &[
-    ("claude-code", "claude", "Claude Code"),
-    ("codex", "codex", "Codex"),
-    ("copilot", "copilot", "GitHub Copilot"),
-    ("grok", "grok", "Grok Build"),
-    ("gemini-cli", "gemini", "Gemini CLI"),
-    ("antigravity", "agy", "Antigravity"),
-    ("opencode", "opencode", "OpenCode"),
-    ("hermes", "hermes", "Hermes Agent"),
-    ("qwen-code", "qwen", "Qwen Code"),
-    ("goose", "goose", "Goose"),
-    ("maki", "maki", "Maki"),
-    ("aider", "aider", "Aider"),
-    ("dsh", "dsh", "DeepSeek Harness"),
+/// A folder an installer or package manager uses besides PATH, relative to a per-OS base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallPlace {
+    /// `~/<path>`
+    Home(&'static str),
+    /// `%LOCALAPPDATA%/<path>` (Windows)
+    LocalAppData(&'static str),
+    /// `%APPDATA%/<path>` (Windows)
+    AppData(&'static str),
+    /// `%ProgramFiles%/<path>` (Windows)
+    ProgramFiles(&'static str),
+    /// `/Applications/<path>` (macOS)
+    Mac(&'static str),
+}
+
+impl InstallPlace {
+    /// The folder on this computer, when its base exists.
+    fn dir(self) -> Option<PathBuf> {
+        let var = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+        let dir = match self {
+            InstallPlace::Home(rel) => dirs::home_dir()?.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR)),
+            InstallPlace::LocalAppData(rel) => var("LOCALAPPDATA")?.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR)),
+            InstallPlace::AppData(rel) => var("APPDATA")?.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR)),
+            InstallPlace::ProgramFiles(rel) => var("ProgramFiles")?.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR)),
+            InstallPlace::Mac(rel) => PathBuf::from("/Applications").join(rel.replace('/', std::path::MAIN_SEPARATOR_STR)),
+        };
+        dir.is_dir().then_some(dir)
+    }
+}
+
+/// A read-only sign-in check (never a login): what a CLI answers, or the local file a sign-in
+/// leaves behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignInProbe {
+    /// Run `<program> <args>` and read its words and/or exit code.
+    Command {
+        /// The query's arguments, e.g. `["auth", "status"]`.
+        args: &'static [&'static str],
+        /// Lowercase phrases that mean it is signed out.
+        signed_out: &'static [&'static str],
+        /// Lowercase phrases that mean it is signed in.
+        signed_in: &'static [&'static str],
+        /// Exit codes that answer when the text says nothing. `None` when the CLI's codes aren't
+        /// documented.
+        signed_in_code: Option<i32>,
+        signed_out_code: Option<i32>,
+        /// Whether the query answers from this computer (so every scan may run it) or needs the
+        /// network (so only an explicit refresh runs it).
+        local: bool,
+    },
+    /// A credential file under the person's home folder; present means signed in. Nothing runs,
+    /// so it's a local check. `*` in the file name matches any file (an account per file).
+    CredentialFile {
+        /// Home-relative path, e.g. `.gemini/oauth_creds.json` or `.kimi-code/credentials/*.json`.
+        path: &'static str,
+        /// What a missing file means: usually [`SignInState::SignedOut`], or `Unknown` when the
+        /// CLI also accepts an API key or the file name hasn't been confirmed.
+        absent: SignInState,
+    },
+}
+
+/// What a click runs in a terminal of its own to sign in (`program` plus `args`), and what to
+/// tell the person when the CLI itself has to be typed at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignInCommand {
+    /// Arguments after the program; empty starts the CLI interactive.
+    pub args: &'static [&'static str],
+    /// A line to show in the terminal before the CLI starts (e.g. "Type /login and press Enter.").
+    pub tip: Option<&'static str>,
+}
+
+/// One coding agent we can drive: its id, the program names it may be installed under (the first
+/// is its usual name), the name people see, where it installs besides PATH, and how to read its
+/// version and sign-in state without changing anything.
+#[derive(Debug, Clone, Copy)]
+pub struct KnownAgent {
+    pub id: &'static str,
+    pub programs: &'static [&'static str],
+    pub display: &'static str,
+    /// Folders an installer or package manager uses besides PATH.
+    pub places: &'static [InstallPlace],
+    /// `--version`, or empty when there is no safe version query.
+    pub version_args: &'static [&'static str],
+    /// A read-only sign-in query, or `None` when the CLI has none (state stays unverified).
+    pub sign_in: Option<SignInProbe>,
+    /// What a click runs in a terminal to sign in, or `None` when it isn't known safely.
+    pub sign_in_command: Option<SignInCommand>,
+}
+
+/// Where a program was found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallSource {
+    /// On PATH.
+    Path,
+    /// A package manager's global prefix (npm, pnpm, bun…).
+    PackageManager,
+    /// An installer's own folder.
+    KnownFolder,
+    /// Inside a desktop app.
+    AppFolder,
+}
+
+/// Whether the CLI says it is signed in, signed out, or doesn't say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignInState {
+    SignedIn,
+    SignedOut,
+    #[default]
+    Unknown,
+}
+
+/// What the person can expect from an installed agent right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentStatus {
+    /// Signed in (or the CLI has no account concept) and ready to take work.
+    Ready,
+    /// Found, but it says it isn't signed in.
+    NeedsSignIn,
+    /// Found, but its sign-in state couldn't be read safely.
+    #[default]
+    Unverified,
+}
+
+/// A coding agent found on this computer, with what a person needs to choose and use it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AgentInstall {
+    pub id: String,
+    pub display: String,
+    /// The program a run starts.
+    pub program: PathBuf,
+    pub source: InstallSource,
+    /// The version it printed, when a safe query answered.
+    pub version: Option<String>,
+    pub status: AgentStatus,
+    pub sign_in: SignInState,
+    /// When the last sign-in answer arrived (not kept with the settings: it's about this run).
+    #[serde(skip)]
+    pub checked_at: Option<Instant>,
+    /// The last answer couldn't be read (timeout, the program was busy); `sign_in` is the last
+    /// known state, not a new "signed out".
+    #[serde(skip)]
+    pub stale: bool,
+}
+
+impl AgentInstall {
+    fn from_found(agent: KnownAgent, program: PathBuf, source: InstallSource, version: Option<String>, sign_in: SignInState) -> AgentInstall {
+        AgentInstall {
+            id: agent.id.to_string(),
+            display: agent.display.to_string(),
+            program,
+            source,
+            version,
+            status: status_of(sign_in),
+            sign_in,
+            checked_at: Some(Instant::now()),
+            stale: false,
+        }
+    }
+}
+
+/// Known agent CLIs: the typed directory Detect, Settings and runs read.
+pub const KNOWN: &[KnownAgent] = &[
+    KnownAgent {
+        id: "claude-code",
+        programs: &["claude"],
+        display: "Claude Code",
+        places: &[InstallPlace::Home(".local/bin"), InstallPlace::Home(".claude/local")],
+        version_args: &["--version"],
+        // `claude auth status` answers as JSON from this computer: exit code 0 signed in, 1 not.
+        sign_in: Some(SignInProbe::Command {
+            args: &["auth", "status"],
+            signed_out: &[],
+            signed_in: &[],
+            signed_in_code: Some(0),
+            signed_out_code: Some(1),
+            local: true,
+        }),
+        sign_in_command: Some(SignInCommand { args: &["auth", "login"], tip: None }),
+    },
+    KnownAgent {
+        id: "codex",
+        programs: &["codex"],
+        display: "Codex",
+        places: &[],
+        version_args: &["--version"],
+        // `codex login status` writes its answer to stderr; both states exit 0 in the versions
+        // seen here, so the words decide. 待确认: its exit codes aren't documented.
+        sign_in: Some(SignInProbe::Command {
+            args: &["login", "status"],
+            signed_out: &["not logged in", "logged out"],
+            signed_in: &["logged in"],
+            signed_in_code: None,
+            signed_out_code: None,
+            local: true,
+        }),
+        sign_in_command: Some(SignInCommand { args: &["login"], tip: None }),
+    },
+    KnownAgent {
+        id: "copilot",
+        programs: &["copilot"],
+        display: "GitHub Copilot",
+        places: &[],
+        version_args: &["--version"],
+        // Its CLI has no read-only status command: the state stays unverified rather than guessed.
+        sign_in: None,
+        sign_in_command: Some(SignInCommand { args: &["login"], tip: None }),
+    },
+    KnownAgent { id: "grok", programs: &["grok"], display: "Grok Build", places: &[], version_args: &["--version"], sign_in: None, sign_in_command: None },
+    KnownAgent {
+        id: "gemini-cli",
+        programs: &["gemini"],
+        display: "Gemini CLI",
+        places: &[],
+        version_args: &["--version"],
+        // Its OAuth token is left in this file by `gemini` (or `/auth`). 待确认: a person signed
+        // in with GEMINI_API_KEY / GOOGLE_API_KEY has no file and is reported as needing sign-in.
+        sign_in: Some(SignInProbe::CredentialFile { path: ".gemini/oauth_creds.json", absent: SignInState::SignedOut }),
+        sign_in_command: Some(SignInCommand { args: &[], tip: Some("Type /auth and press Enter, then choose how to sign in.") }),
+    },
+    KnownAgent {
+        id: "antigravity",
+        programs: &["agy"],
+        display: "Antigravity",
+        places: &[],
+        version_args: &["--version"],
+        sign_in: None,
+        sign_in_command: None,
+    },
+    KnownAgent {
+        id: "opencode",
+        programs: &["opencode"],
+        display: "OpenCode",
+        places: &[InstallPlace::LocalAppData("Programs/ai.opencode.desktop/resources")],
+        version_args: &["--version"],
+        // `opencode auth list` prints the providers it holds credentials for. 待确认: its wording
+        // isn't documented, so only a clear signed-out phrase is used and anything else stays
+        // unverified instead of guessing "signed in".
+        sign_in: Some(SignInProbe::Command {
+            args: &["auth", "list"],
+            signed_out: &["no credentials", "0 credentials", "not authenticated"],
+            signed_in: &[],
+            signed_in_code: None,
+            signed_out_code: None,
+            local: true,
+        }),
+        sign_in_command: Some(SignInCommand { args: &["auth", "login"], tip: None }),
+    },
+    KnownAgent {
+        id: "hermes",
+        programs: &["hermes"],
+        display: "Hermes Agent",
+        places: &[],
+        version_args: &["--version"],
+        sign_in: None,
+        sign_in_command: None,
+    },
+    KnownAgent {
+        id: "qwen-code",
+        programs: &["qwen"],
+        display: "Qwen Code",
+        places: &[],
+        version_args: &["--version"],
+        // Qwen Code is built on Gemini CLI and keeps the same OAuth file under its own folder.
+        // 待确认: the file name wasn't checked against an install here, and an OpenAI-compatible
+        // API key leaves no file, so a missing file means "unknown", not "signed out".
+        sign_in: Some(SignInProbe::CredentialFile { path: ".qwen/oauth_creds.json", absent: SignInState::Unknown }),
+        sign_in_command: Some(SignInCommand { args: &[], tip: Some("Type /auth and press Enter, then choose how to sign in.") }),
+    },
+    KnownAgent {
+        id: "kimi-code",
+        programs: &["kimi"],
+        display: "Kimi Code",
+        // 待确认: ~/.kimi-code holds credentials; where its installer puts the program itself
+        // isn't confirmed for Windows, so only PATH and package-manager folders are searched.
+        places: &[],
+        version_args: &["--version"],
+        // It keeps one credential file per account and has no status command.
+        sign_in: Some(SignInProbe::CredentialFile { path: ".kimi-code/credentials/*.json", absent: SignInState::SignedOut }),
+        sign_in_command: Some(SignInCommand { args: &["login"], tip: None }),
+    },
+    KnownAgent { id: "goose", programs: &["goose"], display: "Goose", places: &[], version_args: &["--version"], sign_in: None, sign_in_command: None },
+    KnownAgent { id: "maki", programs: &["maki"], display: "Maki", places: &[], version_args: &["--version"], sign_in: None, sign_in_command: None },
+    KnownAgent { id: "aider", programs: &["aider"], display: "Aider", places: &[], version_args: &["--version"], sign_in: None, sign_in_command: None },
+    KnownAgent { id: "dsh", programs: &["dsh"], display: "DeepSeek Harness", places: &[], version_args: &["--version"], sign_in: None, sign_in_command: None },
+    KnownAgent {
+        id: "cursor-cli",
+        programs: &["agent", "cursor-agent"],
+        display: "Cursor CLI",
+        // 待确认: %LOCALAPPDATA%\cursor-agent is community evidence only, so it isn't searched;
+        // the program is looked for on PATH and the sign-in state stays unverified.
+        places: &[],
+        version_args: &["--version"],
+        sign_in: None,
+        sign_in_command: Some(SignInCommand { args: &["login"], tip: None }),
+    },
+    KnownAgent {
+        id: "qoder-cli",
+        programs: &["qoder", "qodercli"],
+        display: "Qoder CLI",
+        // 待确认: its Windows install folder and sign-in command aren't confirmed, so neither is
+        // guessed; the state stays unverified and no login button is offered.
+        places: &[],
+        version_args: &["--version"],
+        sign_in: None,
+        sign_in_command: None,
+    },
+    KnownAgent {
+        id: "codebuddy",
+        programs: &["codebuddy", "cbc", "codebuddy-code"],
+        display: "CodeBuddy",
+        places: &[InstallPlace::LocalAppData("Programs/CodeBuddy CN/bin"), InstallPlace::ProgramFiles("CodeBuddy CN/bin")],
+        version_args: &["--version"],
+        sign_in: Some(SignInProbe::Command {
+            args: &["auth", "status"],
+            signed_out: &["authentication required", "not logged in", "please use /login"],
+            signed_in: &["logged in as", "signed in as", "authenticated"],
+            signed_in_code: None,
+            signed_out_code: None,
+            // It asked the account service and took over 3 seconds here, so it isn't run on launch.
+            local: false,
+        }),
+        sign_in_command: Some(SignInCommand { args: &[], tip: Some("Type /login and press Enter.") }),
+    },
+    KnownAgent {
+        id: "trae-code",
+        programs: &["traecli"],
+        display: "TraeCode",
+        places: &[InstallPlace::LocalAppData("Programs/TraeCLI/bin"), InstallPlace::Home(".trae/bin")],
+        version_args: &["--version"],
+        sign_in: Some(SignInProbe::Command {
+            args: &["login", "status"],
+            signed_out: &["not logged in"],
+            signed_in: &["logged in"],
+            signed_in_code: None,
+            signed_out_code: None,
+            local: true,
+        }),
+        sign_in_command: Some(SignInCommand { args: &["login"], tip: None }),
+    },
 ];
 
 pub fn program_for(agent: &str) -> String {
-    KNOWN.iter().find(|(id, _, _)| *id == agent).map(|(_, p, _)| p.to_string()).unwrap_or_else(|| agent.to_string())
+    KNOWN.iter().find(|a| a.id == agent).and_then(|a| a.programs.first()).copied().unwrap_or(agent).to_string()
+}
+
+/// The program names an agent may be installed under, its usual name first.
+pub fn programs_for(agent: &str) -> &'static [&'static str] {
+    KNOWN.iter().find(|a| a.id == agent).map(|a| a.programs).unwrap_or_default()
+}
+
+/// Whether a click can start this agent's sign-in (a confirmed command exists).
+pub fn can_sign_in(agent: &str) -> bool {
+    KNOWN.iter().any(|a| a.id == agent && a.sign_in_command.is_some())
+}
+
+/// Whether this agent can be chosen to build and read: a run adapter drives it. One without an
+/// adapter (Kimi Code, Cursor CLI, Qoder CLI for now) is still found and its sign-in state read,
+/// but offering it as a backend would only produce a run that can't work.
+pub fn can_run(agent: &str) -> bool {
+    adapters::AgentAdapters::built_in().has_adapter(agent)
+}
+
+/// Where an agent's program is, trying every name it may be installed under.
+pub fn find_agent_program(agent: &str) -> Option<PathBuf> {
+    programs_for(agent).iter().find_map(|program| find_program(program))
+}
+
+/// How long one version query may take, how long a sign-in query may take, and how long a scan's
+/// results are reused.
+const VERSION_PROBE: Duration = Duration::from_millis(2500);
+const SIGN_IN_PROBE: Duration = Duration::from_millis(5000);
+/// A sign-in query that needs the network (CodeBuddy takes 4–12 s here) gets longer, on its own
+/// thread, so it never holds the local answers or the other agents.
+const NETWORK_SIGN_IN_PROBE: Duration = Duration::from_secs(15);
+const AGENT_CACHE_TTL: Duration = Duration::from_secs(60);
+
+struct AgentCache {
+    at: Instant,
+    list: Vec<AgentInstall>,
+}
+
+/// The agents found on this computer, with version and sign-in state. One scan is cached for
+/// [`AGENT_CACHE_TTL`]; `refresh` scans now. `full` also runs sign-in queries that need the
+/// network (a launch keeps to the local ones). Only read-only queries run (`--version`, a status
+/// command); no login is ever started and no config is changed.
+pub fn installed(refresh: bool, full: bool) -> Vec<AgentInstall> {
+    static CACHE: OnceLock<Mutex<Option<AgentCache>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = cache.lock().unwrap_or_else(PoisonError::into_inner);
+    guard.label("agent discovery");
+    if !refresh && let Some(cached) = guard.as_ref().filter(|c| c.at.elapsed() < AGENT_CACHE_TTL) {
+        let mut list = cached.list.clone();
+        if full {
+            // The second pass only fills sign-in state; paths and versions stay as scanned.
+            probe_slow_sign_ins(&mut list);
+            *guard = Some(AgentCache { at: Instant::now(), list: list.clone() });
+        }
+        return list;
+    }
+    let list = discover_agents(full);
+    *guard = Some(AgentCache { at: Instant::now(), list: list.clone() });
+    list
+}
+
+/// The quick scan a launch runs: local answers only.
+pub fn installed_fast() -> Vec<AgentInstall> {
+    installed(false, false)
+}
+
+fn status_of(sign_in: SignInState) -> AgentStatus {
+    match sign_in {
+        SignInState::SignedIn => AgentStatus::Ready,
+        SignInState::SignedOut => AgentStatus::NeedsSignIn,
+        SignInState::Unknown => AgentStatus::Unverified,
+    }
+}
+
+/// The status a row shows for a sign-in answer (Settings and first run read this too).
+pub fn status(sign_in: SignInState) -> AgentStatus {
+    status_of(sign_in)
+}
+
+/// Fills sign-in state for agents whose query needs the network, reusing the paths and versions
+/// already scanned. One thread per query, so a slow account service doesn't hold the others.
+fn probe_slow_sign_ins(list: &mut [AgentInstall]) {
+    let jobs: Vec<(usize, PathBuf, SignInProbe)> = list
+        .iter()
+        .enumerate()
+        .filter_map(|(i, found)| {
+            let agent = KNOWN.iter().find(|a| a.id == found.id)?;
+            let probe = agent.sign_in.filter(|p| matches!(p, SignInProbe::Command { local: false, .. }))?;
+            Some((i, found.program.clone(), probe))
+        })
+        .collect();
+    let (tx, rx) = mpsc::channel::<(usize, SignInState)>();
+    let mut running = 0usize;
+    for (i, program, probe) in jobs {
+        let tx = tx.clone();
+        if std::thread::Builder::new()
+            .name("agent-sign-in".into())
+            .spawn(move || {
+                let state = probe_sign_in(&program, Some(probe), true);
+                let _ = tx.send((i, state));
+            })
+            .is_ok()
+        {
+            running += 1;
+        }
+    }
+    drop(tx);
+    let start = Instant::now();
+    while running > 0 {
+        match rx.recv_timeout(NETWORK_SIGN_IN_PROBE.saturating_sub(start.elapsed())) {
+            Ok((i, state)) => {
+                if let Some(slot) = list.get_mut(i) {
+                    slot.sign_in = state;
+                    slot.status = status_of(state);
+                }
+                running -= 1;
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+/// Whether [`sign_in_states`] asks this agent in the `network` pass: local checks (credential
+/// files and status commands answered from this computer) in the fast pass, the rest in the slow
+/// one. Agents with no check are never asked; their state stays unverified.
+pub fn sign_in_checked(agent: &str, network: bool) -> bool {
+    let Some(found) = KNOWN.iter().find(|a| a.id == agent) else { return false };
+    match found.sign_in {
+        Some(SignInProbe::CredentialFile { .. }) => !network,
+        Some(SignInProbe::Command { local, .. }) => local != network,
+        None => false,
+    }
+}
+
+/// Re-reads sign-in state for `list` only (paths, versions and roles stay as they are), for the
+/// 60-second refresh in Settings → AI. `network == false` runs the checks that answer from this
+/// computer; `true` runs the ones that need the network, with its own longer deadline. Each
+/// check has a thread; only agents that answered are returned, so the caller keeps the last known
+/// state for the rest instead of turning a timeout into "signed out".
+pub fn sign_in_states(list: &[AgentInstall], network: bool) -> Vec<(String, SignInState)> {
+    let deadline = if network { NETWORK_SIGN_IN_PROBE } else { SIGN_IN_PROBE };
+    let jobs: Vec<(String, PathBuf, SignInProbe)> = list
+        .iter()
+        .filter_map(|found| {
+            let probe = KNOWN.iter().find(|a| a.id == found.id)?.sign_in?;
+            sign_in_checked(&found.id, network).then(|| (found.id.clone(), found.program.clone(), probe))
+        })
+        .collect();
+    let (tx, rx) = mpsc::channel::<(String, SignInState)>();
+    let mut running = 0usize;
+    for (id, program, probe) in jobs {
+        let tx = tx.clone();
+        if std::thread::Builder::new()
+            .name("agent-sign-in".into())
+            .spawn(move || {
+                let state = probe_sign_in(&program, Some(probe), network);
+                let _ = tx.send((id, state));
+            })
+            .is_ok()
+        {
+            running += 1;
+        }
+    }
+    drop(tx);
+    let start = Instant::now();
+    let mut answers = Vec::new();
+    while running > 0 {
+        match rx.recv_timeout(deadline.saturating_sub(start.elapsed())) {
+            Ok(pair) => {
+                answers.push(pair);
+                running -= 1;
+            }
+            Err(_) => break,
+        }
+    }
+    answers
+}
+
+/// Every agent whose program is here, probed in parallel so a slow CLI doesn't hold the others.
+fn discover_agents(full: bool) -> Vec<AgentInstall> {
+    let found: Vec<(KnownAgent, PathBuf, InstallSource)> =
+        KNOWN.iter().filter_map(|agent| agent.programs.iter().find_map(|program| locate(program).map(|(path, source)| (*agent, path, source)))).collect();
+    let mut list: Vec<AgentInstall> =
+        found.iter().map(|(agent, program, source)| AgentInstall::from_found(*agent, program.clone(), *source, None, SignInState::Unknown)).collect();
+    let (tx, rx) = mpsc::channel::<(usize, Option<String>, SignInState)>();
+    let mut jobs = 0usize;
+    for (i, (agent, program, _)) in found.into_iter().enumerate() {
+        let tx = tx.clone();
+        if std::thread::Builder::new()
+            .name("agent-probe".into())
+            .spawn(move || {
+                let version = probe_version(&program, agent.version_args);
+                let sign_in = probe_sign_in(&program, agent.sign_in, full);
+                let _ = tx.send((i, version, sign_in));
+            })
+            .is_ok()
+        {
+            jobs += 1;
+        }
+    }
+    drop(tx);
+    let start = Instant::now();
+    let deadline = VERSION_PROBE + SIGN_IN_PROBE;
+    while jobs > 0 {
+        let left = deadline.saturating_sub(start.elapsed());
+        match rx.recv_timeout(left) {
+            Ok((i, version, sign_in)) => {
+                if let Some(slot) = list.get_mut(i) {
+                    slot.version = version;
+                    slot.sign_in = sign_in;
+                    slot.status = status_of(sign_in);
+                }
+                jobs -= 1;
+            }
+            Err(_) => break,
+        }
+    }
+    list
+}
+
+/// The version the CLI prints: the first token that is only a version, so a path or an npm
+/// warning in the same output never becomes one.
+fn probe_version(program: &Path, args: &[&'static str]) -> Option<String> {
+    if args.is_empty() {
+        return None;
+    }
+    let out = Process::new(program.as_os_str()).args(args).timeout(VERSION_PROBE).stdout_cap(8 * 1024).stderr_cap(8 * 1024).run().ok()?;
+    let stdout = out.stdout_text();
+    let text = if stdout.trim().is_empty() { out.stderr_text() } else { stdout };
+    version_token(&text)
+}
+
+fn version_token(text: &str) -> Option<String> {
+    let version_like = |t: &str| {
+        let body = t.strip_prefix('v').or_else(|| t.strip_prefix('V')).unwrap_or(t);
+        body.chars().next().is_some_and(|c| c.is_ascii_digit())
+            && body.contains('.')
+            && body.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
+            && body.chars().take(40).count() >= 3
+    };
+    text.lines().take(24).flat_map(str::split_whitespace).find(|t| version_like(t)).map(|t| {
+        let body = t.strip_prefix('v').or_else(|| t.strip_prefix('V')).unwrap_or(t);
+        body.chars().take(40).collect()
+    })
+}
+
+/// What a read-only sign-in check says. A query that needs the network is skipped unless `full`,
+/// so a launch stays quick. Anything else is [`SignInState::Unknown`], never a guess.
+fn probe_sign_in(program: &Path, probe: Option<SignInProbe>, full: bool) -> SignInState {
+    let Some(probe) = probe else { return SignInState::Unknown };
+    match probe {
+        SignInProbe::CredentialFile { path, absent } => {
+            if credential_present(path) {
+                SignInState::SignedIn
+            } else {
+                absent
+            }
+        }
+        SignInProbe::Command { args, signed_out, signed_in, signed_in_code, signed_out_code, local } => {
+            if !local && !full {
+                return SignInState::Unknown;
+            }
+            let Ok(out) = Process::new(program.as_os_str()).args(args).timeout(SIGN_IN_PROBE).stdout_cap(8 * 1024).stderr_cap(8 * 1024).run() else {
+                return SignInState::Unknown;
+            };
+            let text = format!("{}\n{}", out.stdout_text(), out.stderr_text()).to_lowercase();
+            state_from_answer(&text, out.code, signed_out, signed_in, signed_in_code, signed_out_code)
+        }
+    }
+}
+
+/// What words and an exit code say: words first (a CLI answers in them), then the exit code when
+/// its text says nothing, else unknown.
+fn state_from_answer(
+    text: &str,
+    code: Option<i32>,
+    signed_out: &[&str],
+    signed_in: &[&str],
+    signed_in_code: Option<i32>,
+    signed_out_code: Option<i32>,
+) -> SignInState {
+    let signed_in_by_words = signed_in.iter().any(|p| text.contains(p));
+    let signed_in_by_code = code.zip(signed_in_code).is_some_and(|(c, s)| c == s);
+    let signed_out_by_code = code.zip(signed_out_code).is_some_and(|(c, s)| c == s);
+    if signed_out.iter().any(|p| text.contains(p)) {
+        SignInState::SignedOut
+    } else if signed_in_by_words || signed_in_by_code {
+        SignInState::SignedIn
+    } else if signed_out_by_code {
+        SignInState::SignedOut
+    } else {
+        SignInState::Unknown
+    }
+}
+
+/// Whether a credential file under the person's home folder is there. `*` in the file name means
+/// any file there (one per account); nothing is read, only the folder is listed.
+fn credential_present(path: &'static str) -> bool {
+    dirs::home_dir().and_then(|home| credential_match(&home, path)).unwrap_or(false)
+}
+
+/// [`credential_present`] under `home`; split out so tests can point it at a temp folder.
+fn credential_match(home: &Path, path: &str) -> Option<bool> {
+    let full = home.join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
+    let name = full.file_name()?.to_string_lossy().to_string();
+    let Some(star) = name.find('*') else { return Some(full.is_file()) };
+    let dir = full.parent()?;
+    let (prefix, suffix) = (&name[..star], &name[star + 1..]);
+    let any = std::fs::read_dir(dir).ok()?.flatten().take(256).any(|e| {
+        let file = e.file_name().to_string_lossy().to_string();
+        e.path().is_file() && file.starts_with(prefix) && file.ends_with(suffix)
+    });
+    Some(any)
+}
+
+/// Where a program is and how it got there: PATH first, then package managers' global prefixes,
+/// then the agent's own installer folders, then a desktop app. Detection and runs both use this,
+/// so what is offered is what starts.
+pub fn locate(program: &str) -> Option<(PathBuf, InstallSource)> {
+    if let Some(path) = find_program_in(program, craft_anything_platform::which::search_path()) {
+        return Some((path, InstallSource::Path));
+    }
+    for (dir, source) in package_roots() {
+        if let Some(path) = program_in_dir(&dir, program) {
+            return Some((path, source));
+        }
+    }
+    for place in agent_places(program) {
+        if let Some(path) = place.dir().and_then(|dir| program_in_dir(&dir, program)) {
+            return Some((path, InstallSource::KnownFolder));
+        }
+    }
+    desktop_cli(program, local_app_data().as_deref()).map(|path| (path, InstallSource::AppFolder))
+}
+
+fn agent_places(program: &str) -> &'static [InstallPlace] {
+    KNOWN.iter().find(|a| a.programs.contains(&program)).map(|a| a.places).unwrap_or_default()
+}
+
+/// `program`'s file inside `dir`, with the extensions Windows scripts and programs use.
+fn program_in_dir(dir: &Path, program: &str) -> Option<PathBuf> {
+    let is_it = |p: &Path| p.is_file() && p.file_stem().is_some_and(|s| s.eq_ignore_ascii_case(program));
+    let plain = dir.join(program);
+    if is_it(&plain) {
+        return Some(plain);
+    }
+    if cfg!(windows) {
+        for ext in ["exe", "cmd", "bat"] {
+            let p = dir.join(format!("{program}.{ext}"));
+            if is_it(&p) {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// Where package managers put global programs. Nothing is run: environment variables first, then
+/// the person's `.npmrc`, then each platform's usual folders.
+fn package_roots() -> Vec<(PathBuf, InstallSource)> {
+    let mut roots: Vec<(PathBuf, InstallSource)> = Vec::new();
+    let mut push = |dir: PathBuf| {
+        if dir.is_dir() && !roots.iter().any(|(d, _)| *d == dir) {
+            roots.push((dir, InstallSource::PackageManager));
+        }
+    };
+    for key in ["NPM_CONFIG_PREFIX", "npm_config_prefix", "PNPM_HOME", "BUN_INSTALL"] {
+        if let Some(prefix) = std::env::var_os(key).filter(|v| !v.is_empty()).map(PathBuf::from) {
+            if key == "BUN_INSTALL" {
+                push(prefix.join("bin"));
+            } else {
+                push(prefix.join("bin"));
+                push(prefix);
+            }
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        if let Some(prefix) = npmrc_prefix(&home) {
+            push(prefix.join("bin"));
+            push(prefix);
+        }
+        for rel in [".local/bin", ".npm-global/bin", ".bun/bin", ".volta/bin"] {
+            push(home.join(rel));
+        }
+    }
+    if cfg!(windows) {
+        if let Some(app_data) = std::env::var_os("APPDATA").filter(|v| !v.is_empty()).map(PathBuf::from) {
+            push(app_data.join("npm"));
+        }
+        if let Some(program_files) = std::env::var_os("ProgramFiles").filter(|v| !v.is_empty()).map(PathBuf::from) {
+            push(program_files.join("nodejs"));
+        }
+    } else {
+        for dir in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"] {
+            push(PathBuf::from(dir));
+        }
+    }
+    roots
+}
+
+/// The `prefix=` line of `~/.npmrc`, when the person set one.
+fn npmrc_prefix(home: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(home.join(".npmrc")).ok()?;
+    for line in text.lines().take(256) {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else { continue };
+        if key.trim() == "prefix" {
+            let value = value.trim().trim_matches('"').trim_matches('\'');
+            if !value.is_empty() {
+                return Some(PathBuf::from(value));
+            }
+        }
+    }
+    None
+}
+
+/// A program outside PATH, for [`usual_program`]: package managers, installer folders, then a
+/// desktop app.
+fn find_outside_path(program: &str) -> Option<PathBuf> {
+    package_roots()
+        .into_iter()
+        .find_map(|(dir, _)| program_in_dir(&dir, program))
+        .or_else(|| agent_places(program).iter().find_map(|place| place.dir().and_then(|dir| program_in_dir(&dir, program))))
+        .or_else(|| desktop_cli(program, local_app_data().as_deref()))
 }
 
 /// The program a backend runs: the one chosen for it, else the agent's usual name. A chosen path
@@ -79,12 +834,12 @@ fn program_in(config: &BackendConfig, options: &BackendOptions, search: Option<s
     let usual = program_for(&config.model);
     let local = config.ssh_host.as_deref().is_none_or(|h| h.trim().is_empty());
     let Some(chosen) = options.command.as_deref().map(str::trim).filter(|c| !c.is_empty()) else {
-        return if local { Ok(usual_program(&usual, search)?.unwrap_or(usual)) } else { Ok(usual) };
+        return if local { Ok(usual_agent_program(&config.model, search)?.unwrap_or(usual)) } else { Ok(usual) };
     };
     // A folder or app bundle saved before set_command refused it (#467) can't be started: the usual
     // program is used, as when none is chosen.
     if local && Path::new(chosen).is_dir() {
-        return Ok(usual_program(&usual, search)?.unwrap_or(usual));
+        return Ok(usual_agent_program(&config.model, search)?.unwrap_or(usual));
     }
     let path = Path::new(chosen);
     let bare = path.parent().is_none_or(|p| p.as_os_str().is_empty());
@@ -103,7 +858,20 @@ fn program_in(config: &BackendConfig, options: &BackendOptions, search: Option<s
     }
     // Gone, and nothing beside it: the usual program if it's really here, else the saved path, so
     // the error names it.
-    Ok(moved_program(path).or_else(|| usual_program(&usual, search).ok().flatten()).unwrap_or_else(|| chosen.to_string()))
+    Ok(moved_program(path).or_else(|| usual_agent_program(&config.model, search).ok().flatten()).unwrap_or_else(|| chosen.to_string()))
+}
+
+/// How to start an agent's usual program, trying each name it may be installed under. The usual
+/// name's error (the Claude desktop app) is kept, so a real problem is said rather than hidden.
+fn usual_agent_program(agent: &str, search: Option<std::ffi::OsString>) -> Result<Option<String>, ToolError> {
+    let programs = programs_for(agent);
+    let Some((first, rest)) = programs.split_first() else { return usual_program(agent, search) };
+    for program in rest {
+        if let Ok(Some(found)) = usual_program(program, search.clone()) {
+            return Ok(Some(found));
+        }
+    }
+    usual_program(first, search)
 }
 
 /// How to start the usual program: its name, or the real program's path when the name alone would
@@ -112,7 +880,7 @@ fn program_in(config: &BackendConfig, options: &BackendOptions, search: Option<s
 fn usual_program(usual: &str, search: Option<std::ffi::OsString>) -> Result<Option<String>, ToolError> {
     let first = craft_anything_platform::which::which_in(usual, search.clone()).into_iter().next();
     match (first, find_program_in(usual, search)) {
-        (None, _) => Ok(desktop_cli(usual, local_app_data().as_deref()).map(|cli| cli.display().to_string())),
+        (None, _) => Ok(find_outside_path(usual).map(|cli| cli.display().to_string())),
         (Some(first), Some(real)) => Ok(Some(if first == real { usual.to_string() } else { real.display().to_string() })),
         (Some(app), None) => Err(desktop_app_error(&app)),
     }
@@ -127,10 +895,10 @@ fn desktop_app_error(app: &Path) -> ToolError {
 }
 
 /// Where an agent's program is on this computer: the first match on the search path that is
-/// really it. Detection, the desktop app hint and starting a run all look through this, so what's
-/// offered is what runs.
+/// really it, then package managers and installer folders. Detection, the desktop app hint and
+/// starting a run all look through this, so what's offered is what runs.
 pub fn find_program(program: &str) -> Option<PathBuf> {
-    find_program_in(program, craft_anything_platform::which::search_path()).or_else(|| desktop_cli(program, local_app_data().as_deref()))
+    locate(program).map(|(path, _)| path)
 }
 
 /// Agents whose Windows desktop app keeps the command-line program in its own folder, under
@@ -178,7 +946,7 @@ fn moved_program(missing: &Path) -> Option<String> {
 }
 
 pub fn display_for(agent: &str) -> String {
-    KNOWN.iter().find(|(id, _, _)| *id == agent).map(|(_, _, d)| d.to_string()).unwrap_or_else(|| agent.to_string())
+    KNOWN.iter().find(|a| a.id == agent).map(|a| a.display.to_string()).unwrap_or_else(|| agent.to_string())
 }
 
 /// The built-in adapter for an agent id (the plain one for agents without their own).
@@ -1207,6 +1975,106 @@ impl Drop for CliConversation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A program installed off PATH (a package manager's global prefix) is still found, with the
+    /// extension the platform's shims use.
+    #[test]
+    fn a_program_is_found_in_a_package_prefix() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("bin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = if cfg!(windows) { dir.join("codebuddy.cmd") } else { dir.join("codebuddy") };
+        std::fs::write(&file, b"").unwrap();
+        assert_eq!(program_in_dir(&dir, "codebuddy"), Some(file));
+        assert_eq!(program_in_dir(&dir, "traecli"), None);
+    }
+
+    /// The npm global prefix is read from `.npmrc`, without starting npm.
+    #[test]
+    fn npm_prefix_is_read_from_npmrc() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join(".npmrc"), "registry=https://example.invalid/\nprefix = 'C:\\tools\\npm'  \n").unwrap();
+        assert_eq!(npmrc_prefix(d.path()), Some(PathBuf::from(r"C:\tools\npm")));
+        std::fs::write(d.path().join(".npmrc"), "registry=https://example.invalid/\n").unwrap();
+        assert_eq!(npmrc_prefix(d.path()), None);
+    }
+
+    /// A version is taken only from a token that is just a version; a path or warning in the same
+    /// output never becomes one.
+    #[test]
+    fn a_version_is_read_from_a_version_token_only() {
+        assert_eq!(version_token("traecli 0.213.1\n"), Some("0.213.1".into()));
+        assert_eq!(version_token("opencode v2.2.0\n"), Some("2.2.0".into()));
+        assert_eq!(version_token("2.181.0"), Some("2.181.0".into()));
+        assert_eq!(version_token("程序“claude.exe”无法运行: 位于 C:\\Users\\u\\.workbuddy\\node\\versions\\24.14.0\\claude.exe\n"), None);
+        assert_eq!(version_token("no version here"), None);
+    }
+
+    #[test]
+    fn a_sign_in_answer_becomes_a_status() {
+        assert_eq!(status_of(SignInState::SignedIn), AgentStatus::Ready);
+        assert_eq!(status_of(SignInState::SignedOut), AgentStatus::NeedsSignIn);
+        assert_eq!(status_of(SignInState::Unknown), AgentStatus::Unverified);
+    }
+
+    /// The agents whose sign-in state we can read safely say how to ask, and agents whose shape
+    /// isn't confirmed stay unverified instead of being guessed.
+    #[test]
+    fn known_agents_have_read_only_sign_in_checks() {
+        let probe_args = |id: &str| match KNOWN.iter().find(|a| a.id == id).and_then(|a| a.sign_in).expect(id) {
+            SignInProbe::Command { args, .. } => args,
+            other => panic!("{id} isn't a command probe: {other:?}"),
+        };
+        assert_eq!(probe_args("codebuddy"), ["auth", "status"]);
+        assert_eq!(probe_args("trae-code"), ["login", "status"]);
+        assert_eq!(probe_args("claude-code"), ["auth", "status"]);
+        assert_eq!(probe_args("codex"), ["login", "status"]);
+        assert_eq!(probe_args("opencode"), ["auth", "list"]);
+        let claude = KNOWN.iter().find(|a| a.id == "claude-code").unwrap().sign_in.unwrap();
+        assert!(matches!(claude, SignInProbe::Command { signed_in_code: Some(0), signed_out_code: Some(1), .. }), "exit codes decide");
+        for id in ["gemini-cli", "qwen-code", "kimi-code"] {
+            assert!(matches!(KNOWN.iter().find(|a| a.id == id).unwrap().sign_in, Some(SignInProbe::CredentialFile { .. })), "{id} reads a credential file");
+        }
+        // Cursor and Qoder keep "unverified": their status command and folders aren't confirmed.
+        for id in ["cursor-cli", "qoder-cli"] {
+            assert!(KNOWN.iter().find(|a| a.id == id).unwrap().sign_in.is_none(), "{id} stays unverified");
+        }
+        assert!(KNOWN.iter().find(|a| a.id == "qoder-cli").unwrap().sign_in_command.is_none(), "no guessed login command");
+        let aider = KNOWN.iter().find(|a| a.id == "aider").unwrap();
+        assert!(aider.sign_in.is_none(), "no safe status command: left unverified");
+        assert!(KNOWN.iter().all(|a| a.id != "iflow" && a.id != "mmx"), "not collected by decision");
+        assert!(KNOWN.iter().all(|a| a.id != "kimi-code" || a.places.is_empty()), "no guessed Kimi install folder");
+    }
+
+    /// Words decide first; the exit code answers only when the text says nothing.
+    #[test]
+    fn a_sign_in_answer_reads_words_then_codes() {
+        // Claude Code: JSON with no words we match, so its exit codes decide.
+        assert_eq!(state_from_answer(r#"{"loggedIn": false}"#, Some(1), &[], &[], Some(0), Some(1)), SignInState::SignedOut);
+        assert_eq!(state_from_answer(r#"{"loggedIn": true}"#, Some(0), &[], &[], Some(0), Some(1)), SignInState::SignedIn);
+        // Codex: both states exit 0, so its words decide.
+        assert_eq!(state_from_answer("not logged in", Some(0), &["not logged in"], &["logged in"], None, None), SignInState::SignedOut);
+        assert_eq!(state_from_answer("logged in as u", Some(0), &["not logged in"], &["logged in"], None, None), SignInState::SignedIn);
+        // Nothing says anything: unknown, never a guess.
+        assert_eq!(state_from_answer("hello", Some(0), &[], &[], None, None), SignInState::Unknown);
+        assert_eq!(state_from_answer("hello", None, &[], &[], Some(0), Some(1)), SignInState::Unknown);
+    }
+
+    /// A credential file is matched by name (or any `*.ext` in its folder) without reading it.
+    #[test]
+    fn credential_files_are_matched_without_running_anything() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(credential_match(d.path(), ".gemini/oauth_creds.json"), Some(false));
+        std::fs::create_dir_all(d.path().join(".gemini")).unwrap();
+        std::fs::write(d.path().join(".gemini/oauth_creds.json"), b"{}").unwrap();
+        assert_eq!(credential_match(d.path(), ".gemini/oauth_creds.json"), Some(true));
+        // One file per account: any json in the folder counts, a txt doesn't.
+        std::fs::create_dir_all(d.path().join(".kimi-code/credentials")).unwrap();
+        std::fs::write(d.path().join(".kimi-code/credentials/a.txt"), b"").unwrap();
+        assert_eq!(credential_match(d.path(), ".kimi-code/credentials/*.json"), Some(false));
+        std::fs::write(d.path().join(".kimi-code/credentials/a.json"), b"").unwrap();
+        assert_eq!(credential_match(d.path(), ".kimi-code/credentials/*.json"), Some(true));
+    }
 
     /// #721: Codex's desktop app keeps its CLI in `bin/<build>/codex.exe` and moves it on every
     /// update; a backend set to the old path kept failing on a file that was gone.
@@ -2520,7 +3388,7 @@ echo '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
         reg.register(Arc::new(EchoAgent));
         assert_eq!(
             format!("{reg:?}"),
-            r#"["claude-code", "codex", "gemini-cli", "opencode", "antigravity", "hermes", "maki", "aider", "copilot", "grok", "dsh", "echo-agent"]"#
+            r#"["claude-code", "codex", "gemini-cli", "opencode", "antigravity", "hermes", "maki", "aider", "copilot", "grok", "dsh", "codebuddy", "trae-code", "echo-agent"]"#
         );
     }
 

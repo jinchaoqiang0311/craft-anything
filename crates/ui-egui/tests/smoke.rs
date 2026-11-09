@@ -2723,6 +2723,7 @@ fn only_the_claude_desktop_app_is_named_when_nothing_can_build() {
         },
         reason: "From ~/.ssh/config".into(),
         needs_key: false,
+        agent: None,
     };
     h.state_mut().detected = Some(vec![remote("Claude Code on box")]);
     h.run_steps(2);

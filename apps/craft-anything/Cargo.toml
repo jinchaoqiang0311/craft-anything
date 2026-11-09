@@ -18,6 +18,9 @@ craft-anything-setup = { workspace = true }
 craft-anything-ui-egui = { workspace = true }
 eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit", "wayland", "x11", "persistence"] }
 log = { workspace = true }
+# Asking which graphics cards a backend offers, before the window is asked for (renderer.rs):
+# wgpu's adapter list is async, and this runs on the start path.
+pollster = "0.4"
 # The one dialog the app shows itself: when its window can't open, so a start that shows nothing
 # still says why (#166).
 rfd = { workspace = true }

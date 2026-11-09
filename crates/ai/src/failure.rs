@@ -81,10 +81,14 @@ impl TurnFailure {
         })
     }
 
-    /// Without a protocol error, a process may have crashed or lost its connection. Signals
-    /// and nonzero exits keep the same bounded retry policy; a successful exit never opts in.
+    /// Without a protocol error, only a killed process (no exit code) may have lost its connection.
+    /// A program that exited on its own with a nonzero code is not retried: its common causes —
+    /// rejected arguments, a missing tool, a signed-out account — repeat exactly.
     pub(crate) fn process_exit(code: Option<i32>) -> Self {
-        Self::new(if code == Some(0) { FailureKind::Unknown } else { FailureKind::Transient })
+        Self::new(match code {
+            None => FailureKind::Transient,
+            _ => FailureKind::Unknown,
+        })
     }
 }
 
@@ -163,10 +167,13 @@ mod tests {
         assert_eq!(retry_after("Rate limit reached. Retry after 2 minutes"), Some(120));
         assert_eq!(retry_after("try again in 500ms"), Some(1));
         assert_eq!(retry_after("Retry in 45 seconds"), Some(45));
-        for code in [None, Some(1), Some(2), Some(255)] {
-            assert!(TurnFailure::process_exit(code).retryable());
+        // A killed process may have lost its connection, so one more try can help. An exit code is
+        // the program's own answer (arguments refused, a tool missing, not signed in): a retry
+        // repeats it, so it is not retryable.
+        assert!(TurnFailure::process_exit(None).retryable());
+        for code in [Some(0), Some(1), Some(2), Some(255)] {
+            assert!(!TurnFailure::process_exit(code).retryable(), "{code:?}");
         }
-        assert!(!TurnFailure::process_exit(Some(0)).retryable());
         assert_eq!(retry_after("retry after 3 h"), Some(MAX_RETRY_WAIT));
         for text in ["retry after NaN", "retry after inf", "retry after -1s", "invalid command", "please retry in a moment", "retry in ."] {
             assert_eq!(retry_after(text), None);

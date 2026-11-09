@@ -478,6 +478,11 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
                                             }
                                         }
                                     });
+                                    // Where the list came from, or why it's empty: the agent's own
+                                    // answer, not a catalogue kept in the interface.
+                                    if let Some(note) = craft_anything_ai::cli_agents::adapter_for(&b.model).model_choices_note(models) {
+                                        ui.label(RichText::new(note).color(t.text_faint).size(theme::CAPTION));
+                                    }
                                     // A model the list doesn't offer: a newer one, a variant such as
                                     // `opusplan`, or one another harness serves (#470).
                                     let id = egui::Id::new(("other-model", &b.name));
@@ -699,6 +704,11 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
                 ui.vertical(|ui| {
                     ui.label(RichText::new(&d.suggestion.name).font(theme::medium(theme::SMALL)));
                     ui.label(RichText::new(&d.reason).color(t.text_faint).size(theme::CAPTION));
+                    if let Some(agent) = &d.agent
+                        && crate::detect_tabs::agent_detail(ui, agent)
+                    {
+                        app.act("agent_sign_in", serde_json::json!({"agent": agent.id}), tr("Sign in"));
+                    }
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if configured {
@@ -712,6 +722,8 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
                                 app.add_backend(craft_anything_ai::BackendConfig { name, ..d.suggestion.clone() }, None);
                             }
                         }
+                    } else if !crate::detect_tabs::runnable(&d) {
+                        widgets::pill(ui, "Status only", t.text_faint, t.raised);
                     } else if !d.needs_key && widgets::primary(ui, "Add").clicked() {
                         app.add_backend(d.suggestion.clone(), None);
                     }

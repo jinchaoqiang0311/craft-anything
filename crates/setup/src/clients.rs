@@ -27,6 +27,7 @@ pub const ENV_KEYS: &[&str] = &[
     "KIMI_CODE_HOME",
     "FACTORY_HOME_OVERRIDE",
     "ANTIGRAVITY_HOME",
+    "CODEBUDDY_CONFIG_DIR",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -439,6 +440,10 @@ pub fn clients(host: &Host) -> Vec<Client> {
     let wb = h.join(".workbuddy");
     add("workbuddy", "WorkBuddy", wb.join("mcp.json"), vec![wb.clone()], Format::Jsonc, vec!["mcpServers"], Shape::Plain, Some(wb.join("skills")));
 
+    // CodeBuddy Code (`~/.codebuddy/mcp.json`; `CODEBUDDY_CONFIG_DIR` moves the folder)
+    let cb = host.var("CODEBUDDY_CONFIG_DIR").unwrap_or_else(|| h.join(".codebuddy"));
+    add("codebuddy", "CodeBuddy", cb.join("mcp.json"), vec![cb.clone()], Format::Jsonc, vec!["mcpServers"], Shape::Plain, None);
+
     // DeepSeek harness: its config is a patch list we don't edit automatically.
     let dsh = host.var("DSH_HOME").unwrap_or_else(|| h.join(".dsh"));
     add("dsh", "DeepSeek harness (DSH)", dsh.join("cordis.patch.yml"), vec![dsh.clone()], Format::Manual, vec![], Shape::Plain, None);
@@ -491,13 +496,16 @@ mod tests {
         assert_eq!(of("kimi_code").config, PathBuf::from("/home/u/.kimi-code/mcp.json"));
         assert_eq!(of("factory_droid").config, PathBuf::from("/home/u/.factory/mcp.json"));
         assert_eq!(of("workbuddy").config, PathBuf::from("/home/u/.workbuddy/mcp.json"));
+        assert_eq!(of("codebuddy").config, PathBuf::from("/home/u/.codebuddy/mcp.json"));
         let mut moved = Host::with_home("/home/u");
         moved.env.insert("KIMI_CODE_HOME".into(), "/x/kimi".into());
         moved.env.insert("FACTORY_HOME_OVERRIDE".into(), "/x/home".into());
+        moved.env.insert("CODEBUDDY_CONFIG_DIR".into(), "/x/cb".into());
         let cs = clients(&moved);
         let of = |id: &str| cs.iter().find(|c| c.id == id).unwrap();
         assert_eq!(of("kimi_code").config, PathBuf::from("/x/kimi/mcp.json"));
         assert_eq!(of("factory_droid").config, PathBuf::from("/x/home/.factory/mcp.json"));
+        assert_eq!(of("codebuddy").config, PathBuf::from("/x/cb/mcp.json"));
     }
 
     #[test]

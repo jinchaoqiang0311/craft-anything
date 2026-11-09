@@ -77,7 +77,21 @@ impl BackendKind {
             BackendKind::Openrouter => openai::OPENROUTER_MODELS,
             BackendKind::Gemini => openai::GEMINI_MODELS,
             BackendKind::OpenaiCompatible => &[],
-            BackendKind::AgentCli => &["claude-code", "codex", "copilot", "grok", "gemini-cli", "opencode", "antigravity", "hermes", "maki", "aider", "dsh"],
+            BackendKind::AgentCli => &[
+                "claude-code",
+                "codex",
+                "copilot",
+                "grok",
+                "gemini-cli",
+                "opencode",
+                "antigravity",
+                "hermes",
+                "maki",
+                "aider",
+                "dsh",
+                "codebuddy",
+                "trae-code",
+            ],
         }
     }
 
@@ -231,6 +245,9 @@ pub struct Detected {
     pub reason: String,
     /// True when a key is still needed before it works.
     pub needs_key: bool,
+    /// For a coding agent: its program, version and sign-in state, typed for the UI and clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<cli_agents::AgentInstall>,
 }
 
 /// Events the UI renders, in order.
@@ -371,6 +388,7 @@ pub fn tools() -> Vec<craft_anything_engine::ToolSpec> {
     v.extend(key_tools::specs());
     v.extend(model_tools::specs());
     v.extend(model_options::specs());
+    v.extend(cli_agents::sign_in::specs());
     v
 }
 
@@ -439,6 +457,12 @@ impl AiHub {
     /// Why a coding agent people expect may not be found (only the Claude desktop app, say).
     pub fn detect_hints(&self) -> Vec<detect::DetectHint> {
         detect::hints()
+    }
+
+    /// Coding agents installed on this computer, with program, version and sign-in state. One scan
+    /// is cached; `refresh` rescans now. Safe to call off the UI thread (it runs bounded queries).
+    pub fn agents(&self, refresh: bool) -> Vec<cli_agents::AgentInstall> {
+        cli_agents::installed(refresh, true)
     }
 
     /// Host aliases from `~/.ssh/config`, for the "run on another machine" picker.
@@ -534,7 +558,15 @@ impl AiHub {
         if let Some(k) = key.filter(|k| !k.trim().is_empty()) {
             self.keys.set(&entry.config.name, k.trim())?;
         }
+        // Adding an agent is choosing it: it builds and reads the original, so one choice is
+        // enough and no other setting is asked. The latest one added wins.
+        let choose_both = entry.config.enabled && entry.config.kind == BackendKind::AgentCli;
+        let chosen = entry.config.name.clone();
         cfg.upsert(entry);
+        if choose_both {
+            cfg.roles.insert(config::role_key(Role::Builder).to_string(), chosen.clone());
+            cfg.roles.insert(config::role_key(Role::Extractor).to_string(), chosen);
+        }
         self.save_config(&cfg)
     }
 

@@ -205,6 +205,12 @@ fn brain_card(app: &mut CraftApp, ui: &mut Ui, d: &Detected) {
             ui.vertical(|ui| {
                 ui.label(theme::heading(&name, theme::CARD));
                 ui.label(RichText::new(&d.reason).color(t.text_dim).size(theme::SMALL));
+                if let Some(agent) = &d.agent {
+                    ui.add_space(2.0);
+                    if crate::detect_tabs::agent_detail(ui, agent) {
+                        app.act("agent_sign_in", serde_json::json!({"agent": agent.id}), crate::i18n::tr("Sign in"));
+                    }
+                }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if on {
@@ -213,6 +219,8 @@ fn brain_card(app: &mut CraftApp, ui: &mut Ui, d: &Detected) {
                     if widgets::secondary(ui, None, "Use this").clicked() {
                         app.choose_backend(Some(name.clone()));
                     }
+                } else if !crate::detect_tabs::runnable(d) {
+                    widgets::pill(ui, "Status only", t.text_faint, t.raised);
                 } else if !d.needs_key && widgets::primary(ui, "Use this").clicked() {
                     app.add_backend(d.suggestion.clone(), None);
                 }

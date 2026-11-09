@@ -9,6 +9,7 @@
 use craft_anything_engine::evidence::Confidence;
 use egui::{Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Stroke, TextStyle, Visuals};
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -238,7 +239,13 @@ pub fn install_fonts(ctx: &egui::Context) {
         }
     }
     // Sans first: a mincho/serif fallback makes Japanese and Chinese UI text look like prose.
-    let fallbacks = sans_first(fallbacks);
+    let mut fallbacks = sans_first(fallbacks);
+    // A build without craft-fonts (a plain local `cargo run`) has no Han glyphs, so Chinese,
+    // Japanese and Korean labels draw as boxes. A system face keeps them readable; the embedded
+    // faces stay ahead of it, and a machine without one behaves exactly as before.
+    if !embedded_covers_cjk(CRAFT_FONTS) && !add_system_cjk_face(&mut fonts, &mut fallbacks) {
+        log::warn!("no system CJK font found: Chinese, Japanese and Korean text may draw as boxes");
+    }
     fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "DMSans".to_owned());
     fonts.families.entry(FontFamily::Monospace).or_default().insert(0, "JetBrainsMono".to_owned());
     for fam in [FontFamily::Proportional, FontFamily::Monospace] {
@@ -251,6 +258,67 @@ pub fn install_fonts(ctx: &egui::Context) {
         fonts.families.insert(FontFamily::Name(fam.into()), stack);
     }
     ctx.set_fonts(fonts);
+}
+
+/// The largest system face kept in memory (about 40 MB).
+const SYSTEM_FACE_CAP: u64 = 40 * 1024 * 1024;
+
+/// A system font that can draw CJK, and the face index to use inside a collection (`.ttc`).
+struct SystemFace {
+    name: &'static str,
+    path: PathBuf,
+    index: u32,
+}
+
+/// Where this computer keeps a CJK face, most wanted first.
+fn system_cjk_candidates() -> Vec<SystemFace> {
+    let windows_fonts = std::env::var_os("WINDIR").filter(|v| !v.is_empty()).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows")).join("Fonts");
+    let mut faces = Vec::new();
+    if cfg!(windows) {
+        faces.push(SystemFace { name: "system:MicrosoftYaHei", path: windows_fonts.join("msyh.ttc"), index: 0 });
+        faces.push(SystemFace { name: "system:SimHei", path: windows_fonts.join("simhei.ttf"), index: 0 });
+        faces.push(SystemFace { name: "system:SimSun", path: windows_fonts.join("simsun.ttc"), index: 0 });
+    } else if cfg!(target_os = "macos") {
+        faces.push(SystemFace { name: "system:PingFang", path: PathBuf::from("/System/Library/Fonts/PingFang.ttc"), index: 0 });
+        faces.push(SystemFace { name: "system:HiraginoSansGB", path: PathBuf::from("/System/Library/Fonts/Hiragino Sans GB.ttc"), index: 0 });
+    } else {
+        faces.push(SystemFace { name: "system:NotoSansCJK", path: PathBuf::from("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"), index: 0 });
+        faces.push(SystemFace { name: "system:DroidSansFallback", path: PathBuf::from("/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf"), index: 0 });
+    }
+    faces
+}
+
+/// Read a system font only when it is a real, non-empty file within `cap`; a missing one returns
+/// `None` (never an error, never a panic).
+fn read_face(path: &Path, cap: u64) -> Option<Vec<u8>> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() == 0 || meta.len() > cap {
+        return None;
+    }
+    std::fs::read(path).ok()
+}
+
+/// Whether the embedded craft-fonts already draw CJK (Han, Japanese or Korean), so a build that
+/// has them keeps its current faces and doesn't load a system one.
+fn embedded_covers_cjk(fonts: &[CraftFont]) -> bool {
+    fonts.iter().filter(|f| f.style.eq_ignore_ascii_case("regular")).any(|f| f.scripts.iter().any(|script| matches!(*script, "Hani" | "Jpan" | "Kore")))
+}
+
+/// Add the first readable system CJK face to `fonts`, naming it in `fallbacks`; false when this
+/// computer has none.
+fn add_system_cjk_face(fonts: &mut FontDefinitions, fallbacks: &mut Vec<String>) -> bool {
+    for face in system_cjk_candidates() {
+        let Some(bytes) = read_face(&face.path, SYSTEM_FACE_CAP) else {
+            log::debug!("no readable CJK font at {}", face.path.display());
+            continue;
+        };
+        let mut data = FontData::from_owned(bytes);
+        data.index = face.index;
+        fonts.font_data.insert(face.name.to_owned(), Arc::new(data));
+        fallbacks.push(face.name.to_owned());
+        return true;
+    }
+    false
 }
 
 /// Fallback faces, most wanted first. A stable sort keeps the manifest's order inside a rank.
@@ -647,6 +715,35 @@ mod tests {
         assert_eq!(fallback_rank("craft:Unknown Face:Regular"), FallbackRank::Other);
         assert_eq!(fallback_rank("craft:BIZ UDMincho:Regular"), FallbackRank::Serif);
         assert_eq!(fallback_rank("craft:BIZ UDPGothic:Regular"), FallbackRank::Local);
+    }
+
+    /// A system face is read only when it is a real file within the cap; a directory or a
+    /// too-large file is skipped instead of read.
+    #[test]
+    fn a_system_face_is_read_only_from_a_real_file_within_the_cap() {
+        let font = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/fonts/DMSans-Regular.ttf");
+        assert!(read_face(&font, SYSTEM_FACE_CAP).is_some(), "a committed face is readable");
+        assert_eq!(read_face(&font, 1), None, "a 1-byte cap refuses it");
+        assert_eq!(read_face(Path::new(env!("CARGO_MANIFEST_DIR")), SYSTEM_FACE_CAP), None, "a directory is not a face");
+        assert_eq!(read_face(Path::new("no-such-craft-font.ttf"), SYSTEM_FACE_CAP), None, "a missing face is skipped, not an error");
+    }
+
+    /// A local build without craft-fonts still draws Chinese when this computer has a CJK face.
+    #[test]
+    fn chinese_shows_when_a_system_font_is_present() {
+        if embedded_covers_cjk(CRAFT_FONTS) {
+            return;
+        }
+        if !system_cjk_candidates().iter().any(|face| read_face(&face.path, SYSTEM_FACE_CAP).is_some()) {
+            return;
+        }
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear();
+        let text = "在此计算机上找到";
+        for font in [FontId::proportional(14.0), FontId::monospace(14.0), medium(14.0), semibold(14.0)] {
+            assert!(ctx.fonts_mut(|f| f.has_glyphs(&font, text)), "{text} shows as boxes in {font:?}");
+        }
     }
 
     /// Releases are built with craft-fonts (#19), and so is CI; a build without them has only

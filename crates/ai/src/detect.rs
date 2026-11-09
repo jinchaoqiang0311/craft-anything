@@ -14,6 +14,9 @@ use std::time::{Duration, Instant};
 pub const PROBE: Duration = Duration::from_millis(300);
 /// Whole-scan bound.
 pub const TOTAL: Duration = Duration::from_millis(1500);
+/// The agent part runs `--version` probes (bounded by the CLI scan's own bound), so it gets its
+/// own budget instead of being dropped when [`TOTAL`] runs out.
+pub const AGENT_TOTAL: Duration = Duration::from_millis(3000);
 
 fn cfg(name: &str, kind: BackendKind, model: &str) -> BackendConfig {
     BackendConfig { name: name.into(), kind, model: model.into(), base_url: None, ssh_host: None, enabled: true }
@@ -32,7 +35,7 @@ pub fn env_keys(get: impl Fn(&str) -> Option<String>) -> Vec<Detected> {
         ("OPENROUTER_API_KEY", "OpenRouter", BackendKind::Openrouter, crate::openai::OPENROUTER_DEFAULT_MODEL),
     ] {
         if get(var).is_some_and(|v| !v.trim().is_empty()) {
-            out.push(Detected { suggestion: cfg(name, kind, model), reason: format!("Found {var} in your environment"), needs_key: false });
+            out.push(Detected { suggestion: cfg(name, kind, model), reason: format!("Found {var} in your environment"), needs_key: false, agent: None });
         }
     }
     // Hosted APIs we know by name. Offered only when their key is already set, like OpenAI and
@@ -43,6 +46,7 @@ pub fn env_keys(get: impl Fn(&str) -> Option<String>) -> Vec<Detected> {
                 suggestion: cfg_at(p.name, p.kind, p.default_model, p.base_url),
                 reason: format!("Found {var} in your environment"),
                 needs_key: false,
+                agent: None,
             });
         }
     }
@@ -56,6 +60,7 @@ pub fn env_keys(get: impl Fn(&str) -> Option<String>) -> Vec<Detected> {
             "Gemini: paste a free key from Google AI Studio (aistudio.google.com/apikey)".into()
         },
         needs_key: !gemini,
+        agent: None,
     });
     // Kimi K3.1 Pro builds through OpenRouter: with its key found, or one the person pastes.
     let found = get("OPENROUTER_API_KEY").is_some_and(|v| !v.trim().is_empty());
@@ -67,6 +72,7 @@ pub fn env_keys(get: impl Fn(&str) -> Option<String>) -> Vec<Detected> {
             "Kimi K3.1 Pro through OpenRouter: paste your OpenRouter key".into()
         },
         needs_key: !found,
+        agent: None,
     });
     // OpenCode Go: a paid subscription, so it is offered only when its key is already set. Gemini
     // and Kimi are offered keyless because they are general model APIs.
@@ -76,6 +82,7 @@ pub fn env_keys(get: impl Fn(&str) -> Option<String>) -> Vec<Detected> {
             suggestion: cfg_at(OPENCODE_GO_NAME, BackendKind::OpenaiCompatible, crate::openai::OPENCODE_GO_DEFAULT_MODEL, crate::openai::OPENCODE_GO_BASE),
             reason: "OpenCode Go, with its key in your environment".into(),
             needs_key: false,
+            agent: None,
         });
     }
     out
@@ -140,19 +147,19 @@ pub fn probe_local(label: &str, base: &str) -> Option<Detected> {
     };
     let mut c = cfg(&format!("{label} (local)"), BackendKind::OpenaiCompatible, &model);
     c.base_url = Some(base.to_string());
-    Some(Detected { suggestion: c, reason, needs_key: false })
+    Some(Detected { suggestion: c, reason, needs_key: false, agent: None })
 }
 
-/// Agent CLIs on PATH.
+/// Agent CLIs found on this computer: PATH, package managers' global prefixes and each agent's
+/// installer folders, with version and sign-in state where a safe query exists.
 pub fn agent_clis() -> Vec<Detected> {
-    crate::cli_agents::KNOWN
-        .iter()
-        .filter_map(|(id, prog, display)| {
-            crate::cli_agents::find_program(prog).map(|p| Detected {
-                suggestion: cfg(display, BackendKind::AgentCli, id),
-                reason: format!("Found {display} at {}", p.display()),
-                needs_key: false,
-            })
+    crate::cli_agents::installed_fast()
+        .into_iter()
+        .map(|agent| Detected {
+            suggestion: cfg(&agent.display, BackendKind::AgentCli, &agent.id),
+            reason: format!("Found {} at {}", agent.display, agent.program.display()),
+            needs_key: false,
+            agent: Some(agent),
         })
         .collect()
 }
@@ -319,11 +326,20 @@ fn servers_to_probe(lm_port: Option<u16>, opencode: Vec<(String, String)>) -> Ve
     all
 }
 
-/// Everything, bounded by [`TOTAL`].
+/// The longest wait left among deadlines still ahead; `None` when every one has passed.
+fn next_wait(deadlines: &[Instant], now: Instant) -> Option<Duration> {
+    deadlines.iter().filter_map(|deadline| deadline.checked_duration_since(now)).max()
+}
+
+/// Everything, each part bounded by its own deadline ([`TOTAL`] for servers, [`AGENT_TOTAL`] for
+/// agents).
 pub fn detect_all() -> Vec<Detected> {
     let start = Instant::now();
     let (tx, rx) = mpsc::channel::<(usize, Vec<Detected>)>();
-    let mut jobs = 0usize;
+    // Each part has its own deadline: servers keep TOTAL, agents get AGENT_TOTAL because they
+    // run `--version` probes (bounded by the CLI scan's own bound), and a shared TOTAL dropped
+    // the whole agent part on a slow machine.
+    let mut pending: Vec<(usize, Instant)> = Vec::new();
     for (i, (label, base)) in local_servers().into_iter().enumerate() {
         let tx = tx.clone();
         if std::thread::Builder::new()
@@ -333,7 +349,7 @@ pub fn detect_all() -> Vec<Detected> {
             })
             .is_ok()
         {
-            jobs += 1;
+            pending.push((i + 10, start + TOTAL));
         }
     }
     {
@@ -345,19 +361,22 @@ pub fn detect_all() -> Vec<Detected> {
             })
             .is_ok()
         {
-            jobs += 1;
+            pending.push((5, start + AGENT_TOTAL));
         }
     }
     drop(tx);
     let mut parts: Vec<(usize, Vec<Detected>)> = vec![(0, env_keys(|v| std::env::var(v).ok()))];
-    while jobs > 0 {
-        let left = TOTAL.saturating_sub(start.elapsed());
-        match rx.recv_timeout(left) {
-            Ok(p) => {
-                parts.push(p);
-                jobs -= 1;
+    while !pending.is_empty() {
+        let now = Instant::now();
+        pending.retain(|(_, deadline)| *deadline > now);
+        let deadlines: Vec<Instant> = pending.iter().map(|(_, deadline)| *deadline).collect();
+        let Some(wait) = next_wait(&deadlines, now) else { break };
+        match rx.recv_timeout(wait) {
+            Ok(part) => {
+                pending.retain(|(i, _)| *i != part.0);
+                parts.push(part);
             }
-            Err(_) => break,
+            Err(_) => pending.clear(),
         }
     }
     let mut hosts = crate::ssh::ssh_hosts();
@@ -375,7 +394,12 @@ fn remote_agents(host: String) -> Vec<Detected> {
         .map(|(id, label)| {
             let mut c = cfg(&format!("{label} on {host}"), BackendKind::AgentCli, id);
             c.ssh_host = Some(host.clone());
-            Detected { suggestion: c, reason: format!("SSH host {host} from ~/.ssh/config (check that {label} is installed there)"), needs_key: false }
+            Detected {
+                suggestion: c,
+                reason: format!("SSH host {host} from ~/.ssh/config (check that {label} is installed there)"),
+                needs_key: false,
+                agent: None,
+            }
         })
         .collect()
 }
@@ -418,6 +442,20 @@ mod tests {
         let hint = DetectHint::ClaudeDesktopWithoutCli { app: PathBuf::from("Claude") };
         assert!(hint.message().contains("desktop app") && hint.message().contains("`claude`"), "{}", hint.message());
         assert_eq!(serde_json::to_value(&hint).unwrap()["kind"], "claude_desktop_without_cli");
+    }
+
+    /// The scan waits for the furthest part still ahead, and never for one whose budget is spent;
+    /// the agent part's budget is longer because it runs `--version` probes.
+    #[test]
+    fn the_scan_waits_for_the_furthest_part_and_not_for_a_spent_one() {
+        let now = Instant::now();
+        let past = now - Duration::from_millis(100);
+        let near = now + Duration::from_millis(100);
+        let far = now + AGENT_TOTAL;
+        assert_eq!(next_wait(&[], now), None);
+        assert_eq!(next_wait(&[past], now), None);
+        assert_eq!(next_wait(&[past, near, far], now), Some(AGENT_TOTAL));
+        assert!(AGENT_TOTAL > TOTAL);
     }
 
     /// Non-Git SSH hosts offer both supported agent suggestions without probing the remote computer.
@@ -650,6 +688,7 @@ mod tests {
     fn whole_scan_is_bounded() {
         let t = Instant::now();
         let _ = detect_all();
-        assert!(t.elapsed() < TOTAL + Duration::from_millis(1500));
+        // The agent part has the longest budget, so it decides the worst case.
+        assert!(t.elapsed() < AGENT_TOTAL + Duration::from_millis(1500));
     }
 }

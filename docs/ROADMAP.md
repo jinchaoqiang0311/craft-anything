@@ -816,6 +816,44 @@ Owner: open · Status: in progress
       — claimed: gtxy27, branch `bugfix/r2.2-dsh-stdin`
 - [ ] DeepSeek Harness: no resume (its headless profile keeps no session), and a build on the harness's
       desktop profile is untried
+- [x] CodeBuddy Code: an adapter runs `codebuddy -p --output-format stream-json` with the task on
+      stdin and our tool server as an inline `--mcp-config` (strict, so only ours) plus `--settings`
+      enabling and allowing it; Clean room keeps none of CodeBuddy's built-in tools (`--tools ""`),
+      a deep builder gets its own, and a saved session is resumed. Print mode has no
+      `--permission-prompt-tool` (its headless page says so), so built-in tools are allowed by name
+      instead of asking the person. `setup` also registers it in `~/.codebuddy/mcp.json` (moved by
+      `CODEBUDDY_CONFIG_DIR`; the app's real file is `mcp.json`, not `.mcp.json`). Adapter, argument,
+      stream, registration and setup tests. Installed live at 2.181.0, but `codebuddy auth status`
+      says an account is required, so no run yet.
+      — claimed: jinchaoqiang0311, branch feature/r2.2-codebuddy-trae-agents
+- [ ] CodeBuddy: sign in (`/login`) and verify the headless stream live (our server starts, the task
+      from stdin arrives, a saved session resumes), and revisit `--allowedTools` if its approval
+      channel changes.
+- [x] TraeCode CLI 2.0: an adapter runs `traecli exec` with the task on stdin, `--sandbox read-only`
+      for a chat and `workspace-write` plus `--permission-mode auto` for a build (a headless run can't
+      ask; the documented `--ask-for-approval` does not exist on 0.213.1), and no positional prompt.
+      Our tool server is added to this run only with `-c mcp_servers.craft-anything={command=...,args=...}`
+      (verified on 0.213.1: `mcp list` sees it and `~/.trae/traecli.toml` is untouched). Clean room is
+      refused: it reads files itself and `exec` has no verified per-run way to disable those built-in
+      tools. Adapter, argument, stdin, `-c` and access tests. Its `--json` event shape is still
+      unverified (a signed-in run is needed; an anonymous `exec --json` printed no events).
+      — claimed: jinchaoqiang0311, branch feature/r2.2-codebuddy-trae-agents
+- [ ] TraeCode: sign in (`traecli login`) and run `exec` live to check its text output and capture the
+      `--json` event shape, then confirm the `-c` server is reachable in that run; only then offer it
+      as a builder with our tools.
+- [x] Detect lists coding agents as the window opens: PATH, package managers' global prefixes
+      (environment and `~/.npmrc`), each agent's installer folders and desktop apps, with a typed
+      program path, version and sign-in state (`AgentInstall`), not a sentence. One cached scan per
+      launch runs read-only `--version` probes in parallel; sign-in state comes only from a status
+      command (never a login). CodeBuddy's status query needs the network (~3.5 s here), so a launch
+      skips it and a second pass fills it in; TraeCode's is local and runs at once. Runs resolve
+      through the same lookup, so an agent found off PATH still starts. `craft-anything-cli ai agents
+      [--refresh]` prints the same list. Live on 2026-11-08: CodeBuddy 2.181.0 (needs sign-in),
+      TraeCode 0.213.1 (needs sign-in), OpenCode 2.2.0; Claude Code's install on this machine is
+      broken (`claude.exe` is not a Windows program), shown as unknown.
+      — claimed: jinchaoqiang0311, branch feature/r2.2-codebuddy-trae-agents
+- [ ] Detect: show why a found program failed its version query (broken install) instead of only
+      "unverified". Settings → AI's Look again already runs the full pass.
 - [ ] `setup` writes the plain `mcp` command, so it drops an `--all-tools` an entry already has, and
       `doctor` then calls that entry "a different copy or shape of the command" and suggests the very
       command that breaks it. The installed skill now warns against running `setup` on such an entry;
