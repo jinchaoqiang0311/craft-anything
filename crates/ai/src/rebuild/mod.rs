@@ -59,7 +59,8 @@ pub mod tools;
 
 use brief::*;
 pub use kinds::{
-    AppKind, BriefCx, BuildCheck, Check, CheckCx, DetectCx, GameKind, KindRegistry, KindWords, MechanicsCheck, TargetKind, WebVisualCheck, WebsiteKind,
+    AppKind, BriefCx, BuildCheck, Check, CheckCx, CheckStop, DetectCx, GameKind, KindRegistry, KindWords, MechanicsCheck, TargetKind, WebVisualCheck,
+    WebsiteKind,
 };
 pub use locate::game_folder;
 use locate::*;
@@ -203,6 +204,13 @@ fn same_question(a: &AskedQuestion, b: &AskedQuestion) -> bool {
     a.at_ms == b.at_ms && a.question == b.question
 }
 
+/// Whether a run without a new request is carrying on work already under way in this mode. For an
+/// API loop, `api_resumed` says its kept transcript matched the run's mode: a transcript from the
+/// other mode isn't carried on, so the run still studies as a fresh one.
+fn is_carrying_on(opts: &RunOptions, ws: &Workspace, api_resumed: bool) -> bool {
+    (opts.continuing || (opts.message.is_none() && ws.builder_started())) && api_resumed
+}
+
 /// A running (or finished) rebuild.
 pub struct RebuildRun {
     rx: Receiver<RunEvent>,
@@ -240,7 +248,11 @@ impl RebuildRun {
         let api = match entry.config.kind {
             BackendKind::AgentCli => None,
             _ => {
-                if opts.message.is_none() || !ws.capture_dir().exists() {
+                // A run carrying on keeps its transcript, so `ApiConversation::resumed` can tell
+                // the run which conversation it continues. Only a genuinely fresh build (no
+                // continuation and no completed Study) starts a new one.
+                let continuing = opts.continuing || (opts.message.is_none() && ws.builder_started());
+                if !continuing && !ws.capture_dir().exists() {
                     let _ = std::fs::remove_file(ws.transcript_path());
                 }
                 Some(hub.start_builder(&entry, opts.beginner, Some(ws.transcript_path()), !clean_room)?)
@@ -250,7 +262,7 @@ impl RebuildRun {
         // study; the run only uses it in Deep mode on a game (see Worker::extract).
         let fresh = opts.message.is_none() || !ws.capture_dir().exists();
         let extractor = match hub.chosen(Role::Extractor).and_then(|n| hub.config().get(&n).cloned()) {
-            Some(e) if fresh && e.config.kind != BackendKind::AgentCli => {
+            Some(e) if fresh && e.config.kind != BackendKind::AgentCli && !clean_room => {
                 let _ = std::fs::remove_file(ws.root.join(EXTRACT_TRANSCRIPT));
                 Some((e.config.name.clone(), hub.start_extractor(&e, opts.beginner, Some(ws.root.join(EXTRACT_TRANSCRIPT)))?))
             }
@@ -287,6 +299,7 @@ impl RebuildRun {
             usage: Some(UsageClock { root: root.clone(), since: Instant::now() }),
             self_check: None,
             reset_progress_after_notes: false,
+            keys: hub.keys.clone(),
         };
         let r2 = running.clone();
         let key_store = hub.keys.clone();
@@ -302,19 +315,7 @@ impl RebuildRun {
                     ctx.load_asset_keys(&key_store);
                     ctx.run(&mut ws, entry, api, extractor, &opts)
                 }));
-                let (ok, message, paused) = match result {
-                    Ok(Ok(m)) => (true, m, false),
-                    Ok(Err(e)) if e.code == ErrorCode::Cancelled => {
-                        let _ = ws.set_status(Status::Stopped, "Paused. Send a message to continue.");
-                        (false, "Paused.".to_string(), true)
-                    }
-                    Ok(Err(e)) => {
-                        let msg = e.for_people();
-                        let _ = ws.set_status(Status::NeedsYou, msg.clone());
-                        (false, msg, false)
-                    }
-                    Err(_) => (false, "The workflow hit a bug and stopped safely. Your files are untouched.".to_string(), false),
-                };
+                let (ok, message, paused) = run_outcome(result, &mut ws);
                 ctx.record_usage(None);
                 // The CLI can exit as soon as it sees completion: release the helper while its
                 // supervisor threads are still available to stop it.
@@ -493,6 +494,8 @@ struct Worker {
     self_check: Option<(Arc<dyn kinds::TargetKind>, f64)>,
     /// A hook consumed a new request; persist its reset only after the builder finishes.
     reset_progress_after_notes: bool,
+    /// The backends' stored keys, for an agent CLI that asks the host to authenticate (Devin).
+    keys: crate::keys::KeyStore,
 }
 
 /// The project a run records its usage in, and when it last did.
@@ -511,6 +514,54 @@ fn emit_event(feed: &Mutex<feed::FeedLog>, tx: &Sender<RunEvent>, wake: &Wake, e
     let _ = tx.send(e);
     drop(feed);
     wake.call();
+}
+
+/// The sessions saved Claude Code `--resume`/`-r` arguments name, in order.
+fn configured_resumes(args: &[String]) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        if arg == "--resume" || arg == "-r" {
+            if let Some(id) = rest.next() {
+                out.push(id.as_str());
+            }
+        } else if let Some(id) = arg.strip_prefix("--resume=") {
+            out.push(id);
+        }
+    }
+    out
+}
+
+/// Whether saved Claude Code arguments ask for the most recent conversation (`-c`/`--continue`).
+fn configured_continues(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--continue" || a == "-c")
+}
+
+/// Refuse saved Claude Code arguments that would continue the project's Deep session in Clean
+/// room: a `--resume` of its id or a `--continue`/`-c` of the latest conversation bypasses the
+/// mode filter and carries what that session read.
+fn refuse_deep_session_reuse_in_clean_room(ws: &Workspace, model: &str, args: &[String], deep: bool) -> Result<(), ToolError> {
+    if deep || !crate::cli_agents::adapter_for(model).ids().contains(&"claude-code") {
+        return Ok(());
+    }
+    let Some(saved) = ws.manifest.agent_session_for(model).filter(|_| ws.manifest.agent_session_deep.unwrap_or(true)) else {
+        return Ok(());
+    };
+    if configured_resumes(args).contains(&saved) {
+        return Err(ToolError::new(
+            ErrorCode::BadSettings,
+            format!("The saved Claude Code arguments resume session {saved}, which was saved in Deep mode, so this Clean room run is refused: that session may have read inside the original."),
+        )
+        .with_remediation(format!("Remove `--resume {saved}` from the Claude Code backend's extra arguments (config.toml), or run this in Deep mode.")));
+    }
+    if configured_continues(args) {
+        return Err(ToolError::new(
+            ErrorCode::BadSettings,
+            "The saved Claude Code arguments continue the most recent conversation, which may be this project's Deep session, so this Clean room run is refused: that session may have read inside the original.",
+        )
+        .with_remediation("Remove `--continue`/`-c` from the Claude Code backend's extra arguments (config.toml), or run this in Deep mode."));
+    }
+    Ok(())
 }
 
 impl Worker {
@@ -583,7 +634,7 @@ impl Worker {
 
     /// The prompt for notes the person added while the agent worked, if there are any, and the
     /// Just-ask answers it carries so they're marked told once the turn finishes.
-    fn added(&self, ws: &mut Workspace, deep: bool) -> Option<(String, Vec<AskedQuestion>)> {
+    fn added(&self, ws: &mut Workspace, deep: bool, sees_pictures: bool) -> Option<(String, Vec<AskedQuestion>)> {
         let mut notes = std::mem::take(&mut *self.notes.lock().unwrap_or_else(PoisonError::into_inner));
         if notes.is_empty() {
             return None;
@@ -611,7 +662,7 @@ impl Worker {
         questions.extend(extra);
         let context = just_asked(&questions);
         let texts: Vec<String> = notes.into_iter().map(|n| n.text).collect();
-        Some((context + &added_prompt(&texts) + &pictures_reminder(ws), questions))
+        Some((context + &added_prompt(&texts) + &pictures_reminder(ws, sees_pictures), questions))
     }
 
     /// Decides an ACP builder's permission requests with the same policy Claude Code's approval
@@ -652,18 +703,21 @@ impl Worker {
     }
 
     /// How the builder's agent runs. Reads the session once: a lock taken twice in one statement
-    /// is held by the first until the statement ends, and the second then waits forever.
-    fn agent_spec(&self, ws: &Workspace, entry: &crate::BackendEntry, opts: &RunOptions) -> CliSpec {
+    /// is held by the first until the statement ends, and the second then waits forever. A saved
+    /// Claude `--resume` that would continue the project's Deep session in Clean room is refused.
+    fn agent_spec(&self, ws: &Workspace, entry: &crate::BackendEntry, opts: &RunOptions) -> Result<CliSpec, ToolError> {
         let (deep, config_dir, targets) = {
             let session = self.engine.session();
             (!session.clean_room(), session.config_dir(), session.shared_targets())
         };
-        CliSpec {
+        refuse_deep_session_reuse_in_clean_room(ws, &entry.config.model, &entry.options.args, deep)?;
+        Ok(CliSpec {
             builder: Some(Builder { investigation: Some(ws.investigation_dir()), inbox: ws.inbox_dir() }),
             deep,
             targets,
             logs: Some(crate::failure_log::dir_in(&config_dir)),
-            resume: ws.manifest.agent_session.clone(),
+            key: crate::cli_agents::acp::key_for(&self.keys, &entry.config.model, &entry.config.name, entry.config.kind),
+            resume: ws.manifest.agent_session_for_mode(&entry.config.model, deep).map(str::to_string),
             preamble: Some(
                 "You work inside Craft Anything for a person who doesn't code. The message below is your task.
 
@@ -672,7 +726,7 @@ impl Worker {
             ),
             adapters: opts.adapters.clone(),
             ..CliSpec::new(entry.config.clone(), entry.options.clone(), opts.beginner, Some(ws.root.clone()))
-        }
+        })
     }
 
     /// The whole run: checks the builder can start, studies a new project, then builds and checks
@@ -705,7 +759,7 @@ impl Worker {
             if let Some(host) = remote_host {
                 adapter.check_remote_tool_server(host, &self.stop)?;
             } else {
-                crate::cli_agents::check_builder_tools(adapter.as_ref(), &entry.config.model, &entry.options, &self.stop)?;
+                crate::cli_agents::check_builder_tools(adapter.as_ref(), &entry.config.model, &entry.options, &ws.root, &self.stop)?;
                 let program = crate::cli_agents::program_of(&entry.config, &entry.options)?;
                 // A saved path that's gone (an update moved it) or would start the wrong app runs another program: say which (#721).
                 if let Some(saved) = crate::cli_agents::replaced_program(&entry.options, &program) {
@@ -734,7 +788,8 @@ impl Worker {
         self.self_check = Some((kind.clone(), opts.good_enough));
         let kind = kind.as_ref();
         self.editor = self.find_editor(&ws.manifest.stack)?;
-        let carrying_on = opts.continuing || (opts.message.is_none() && ws.builder_started());
+        let api_resumed = api.as_ref().is_none_or(crate::agent::ApiConversation::resumed);
+        let carrying_on = is_carrying_on(opts, ws, api_resumed);
         let first = (opts.message.is_none() && !carrying_on) || !ws.capture_dir().exists();
         if first {
             self.study(ws, kind)?;
@@ -745,33 +800,45 @@ impl Worker {
         // A coding agent resumes its own session; our loop resumes its kept transcript.
         let resumable = api.as_ref().is_none_or(crate::agent::ApiConversation::resumed);
         let api_loop = api.is_some();
+        // Agent apps open pictures with their Read tool; the API loop sends text only, so its
+        // builder is told what to use instead (R5.4: models that can see get pictures later).
+        let sees_pictures = !api_loop;
         // A session another coding agent saved can't be continued by this one (#469).
         if !api_loop && ws.manifest.agent_session_by.as_deref() != Some(entry.config.model.as_str()) {
             ws.manifest.agent_session = ws.manifest.agent_session_for(&entry.config.model).map(str::to_string);
             ws.manifest.agent_session_by = Some(entry.config.model.clone());
+            if ws.manifest.agent_session.is_none() {
+                ws.manifest.agent_session_deep = None;
+            }
             ws.save()?;
         }
+        // The run's mode comes from the same read as the resume decision: a settings change while
+        // the run starts can't make the brief, the tool server and the recorded session disagree.
+        let spec = self.agent_spec(ws, &entry, opts)?;
+        let deep = spec.deep;
+        // A session from the other mode is not resumed (it may have read the original there),
+        // so the builder needs the brief as if it had none.
+        let resumed = spec.resume.is_some();
         // A coding agent on this computer whose session the project keeps a copy of (#451).
         let keeper = (!api_loop && !remote).then(|| opts.adapters.for_backend(&entry.config.model, &entry.options));
-        if let Some(a) = &keeper {
+        if resumed && let Some(a) = &keeper {
             self.restore_session(ws, a.as_ref());
         }
-        // A coding agent that never saved a session starts over, so it needs the brief.
-        let has_history = resumable && (api_loop || ws.manifest.agent_session.is_some());
         self.step(ws, Step::Build, Status::Building, "Getting the builder ready…")?;
-        let spec = self.agent_spec(ws, &entry, opts);
+        // A coding agent that never saved a session starts over, so it needs the brief.
+        let has_history = resumable && (api_loop || resumed);
         let mut agent: Box<dyn Conversation> = match api {
             Some(a) => Box::new(a),
             None => crate::cli_agents::builder_conversation(spec, self.approver(ws)),
         };
         // The builder's tool server is started in this run's mode (`--deep` or `--clean-room`).
         let s = self.engine.session();
-        let (deep, ghidra) = (!s.clean_room(), s.settings.ghidra_launcher().is_some());
+        let ghidra = s.settings.ghidra_launcher().is_some();
         let image_model = s.settings.assets.image_model.clone();
         drop(s);
-        let cx = BriefCx { ws, deep, ghidra, editor: self.editor.as_deref(), assets: self.assets, image_model: image_model.as_deref() };
+        let cx = BriefCx { ws, deep, ghidra, editor: self.editor.as_deref(), assets: self.assets, image_model: image_model.as_deref(), sees_pictures };
         // The project's settings as they are now, for an agent that carries on its session.
-        let now = || kind.follow_up_sections(&cx).iter().map(|s| format!("\n\n{s}")).collect::<String>() + &pictures_reminder(ws);
+        let now = || kind.follow_up_sections(&cx).iter().map(|s| format!("\n\n{s}")).collect::<String>() + &pictures_reminder(ws, sees_pictures);
         let mut prompt = match &opts.message {
             // An agent with a saved session gets the follow-up; one without (an API loop) starts
             // from the brief with the request added.
@@ -780,7 +847,7 @@ impl Worker {
             None if carrying_on && !first && has_history => continue_prompt(kind) + &now(),
             _ => {
                 let b = brief(kind, &cx, opts.message.as_deref());
-                if api_loop { format!("{API_BUILDER}\n\n{b}") } else { b }
+                if api_loop { format!("{API_BUILDER}{}\n\n{b}", if sees_pictures { "" } else { BLIND_BUILDER }) } else { b }
             }
         };
         // The extraction step left the original's files in app/Original/: the builder starts from them.
@@ -789,7 +856,7 @@ impl Worker {
         }
         // A saved session may not be on this computer (the project was copied here): then a new
         // one starts from the brief and what the project already has.
-        let mut fresh = (!api_loop && ws.manifest.agent_session.is_some()).then(|| {
+        let mut fresh = (!api_loop && resumed).then(|| {
             let handoff = keeper.as_ref().and_then(|a| a.handoff(&kept_session(ws)?, HANDOFF_CHARS));
             resumed_elsewhere(&brief(kind, &cx, opts.message.as_deref()), &ws.manifest.last_reply, handoff.as_deref())
         });
@@ -812,7 +879,7 @@ impl Worker {
         }
         let mut refinements = 0;
         // Deep mode on a program: decompiling is required, so a build turn without any gets one reminder.
-        let must_decompile = !self.engine.session().clean_room() && matches!(ws.manifest.target, TargetRef::Local { .. });
+        let must_decompile = deep && matches!(ws.manifest.target, TargetRef::Local { .. });
         let mut reminded = false;
         // The builder finished and only the check didn't: the build is there to check.
         let mut only_check = carrying_on && !first && opts.message.is_none() && ws.manifest.awaiting_check;
@@ -833,7 +900,7 @@ impl Worker {
                 };
                 self.step(ws, Step::Build, Status::Building, doing)?;
                 ws.manifest.awaiting_check = false;
-                let reply = self.turn(ws, agent.as_mut(), &prompt, fresh.take());
+                let reply = self.turn(ws, agent.as_mut(), &prompt, deep, fresh.take());
                 // Kept even when the turn failed: the conversation is still worth carrying.
                 if let Some(a) = &keeper {
                     self.keep_session(ws, a.as_ref());
@@ -887,7 +954,7 @@ impl Worker {
                     progress.save(&ws.root)?;
                 }
                 // What the person added while the agent worked goes in before anything else.
-                if let Some((p, more)) = self.added(ws, deep) {
+                if let Some((p, more)) = self.added(ws, deep, sees_pictures) {
                     asked.extend(more);
                     progress.reset();
                     progress.save(&ws.root)?;
@@ -914,7 +981,7 @@ impl Worker {
             for c in &checks {
                 self.emit(RunEvent::Checked(c.clone()));
             }
-            if let Some((p, more)) = self.added(ws, deep) {
+            if let Some((p, more)) = self.added(ws, deep, sees_pictures) {
                 asked.extend(more);
                 progress.reset();
                 progress.save(&ws.root)?;
@@ -944,8 +1011,8 @@ impl Worker {
             refinements += 1;
             // Nothing written yet: a fix for a build that doesn't exist sends the builder looking for one.
             // It is asked to write the project and to show its build output (#736).
-            let refined = if app_is_empty(ws) { NO_PROJECT_PROMPT.to_string() } else { kind.refine(check) };
-            prompt = refined + &pictures_reminder(ws);
+            let refined = if app_is_empty(ws) { NO_PROJECT_PROMPT.to_string() } else { kind.refine(check, sees_pictures) };
+            prompt = refined + &pictures_reminder(ws, sees_pictures);
             if !api_loop {
                 prompt.push_str(CHECK_BEFORE_REPLYING);
             }
@@ -1092,8 +1159,8 @@ impl Worker {
 
     /// `fresh`: what to send instead when the agent's saved session turns out not to be on this
     /// computer.
-    fn turn(&mut self, ws: &mut Workspace, agent: &mut dyn Conversation, prompt: &str, fresh: Option<String>) -> Result<String, ToolError> {
-        self.turn_with_wait(ws, agent, prompt, fresh, |stop, seconds| {
+    fn turn(&mut self, ws: &mut Workspace, agent: &mut dyn Conversation, prompt: &str, deep: bool, fresh: Option<String>) -> Result<String, ToolError> {
+        self.turn_with_wait(ws, agent, prompt, deep, fresh, |stop, seconds| {
             for _ in 0..seconds {
                 stop.check()?;
                 std::thread::sleep(Duration::from_secs(1));
@@ -1102,11 +1169,21 @@ impl Worker {
         })
     }
 
+    /// Keep the session the agent reported, with the mode it ran in; a lost one leaves neither.
+    fn remember_session(ws: &mut Workspace, session: Option<String>, deep: bool) -> Result<(), ToolError> {
+        ws.manifest.agent_session_deep = session.is_some().then_some(deep);
+        ws.manifest.agent_session = session;
+        ws.save()
+    }
+
+    /// Run one turn, retrying what the adapter calls retryable, and keep the session it reports
+    /// with the mode this run started in.
     fn turn_with_wait(
         &mut self,
         ws: &mut Workspace,
         agent: &mut dyn Conversation,
         prompt: &str,
+        deep: bool,
         mut fresh: Option<String>,
         mut wait_for: impl FnMut(&CancelToken, u64) -> Result<(), ToolError>,
     ) -> Result<String, ToolError> {
@@ -1118,11 +1195,9 @@ impl Worker {
             let lost = result.is_err() && agent.session_lost();
             if lost {
                 // The id is for a session this computer doesn't have: never ask for it again.
-                ws.manifest.agent_session = None;
-                ws.save()?;
+                Self::remember_session(ws, None, deep)?;
             } else if let Some(id) = agent.session_id() {
-                ws.manifest.agent_session = Some(id);
-                ws.save()?;
+                Self::remember_session(ws, Some(id), deep)?;
             }
             match result {
                 Err(_) if lost && let Some(f) = fresh.take() => {
@@ -1272,6 +1347,29 @@ impl Worker {
     }
 }
 
+/// What the run says, and the status it leaves on the project, when it ends: paused, failed, or
+/// a caught bug. A caught bug must not leave the saved status as it last was ("Checking" while
+/// nothing runs), or the project looks stuck rather than stopped.
+fn run_outcome(result: Result<Result<String, ToolError>, Box<dyn std::any::Any + Send>>, ws: &mut Workspace) -> (bool, String, bool) {
+    match result {
+        Ok(Ok(m)) => (true, m, false),
+        Ok(Err(e)) if e.code == ErrorCode::Cancelled => {
+            let _ = ws.set_status(Status::Stopped, "Paused. Send a message to continue.");
+            (false, "Paused.".to_string(), true)
+        }
+        Ok(Err(e)) => {
+            let msg = e.for_people();
+            let _ = ws.set_status(Status::NeedsYou, msg.clone());
+            (false, msg, false)
+        }
+        Err(_) => {
+            let msg = "The workflow hit a bug and stopped safely. Your files are untouched.".to_string();
+            let _ = ws.set_status(Status::NeedsYou, msg.clone());
+            (false, msg, false)
+        }
+    }
+}
+
 /// Checks in a row that may find the build not working before the run stops and asks for a new
 /// request. Each "Try again" used to start another `max_rounds` of checks, with nothing counting
 /// across runs, so a build that never came up was checked 40 and 49 times (#736).
@@ -1342,7 +1440,10 @@ fn kept_session(ws: &Workspace) -> Option<String> {
 }
 
 /// What an API-backend builder is told first: its tools differ from an agent app's.
-const API_BUILDER: &str = "Your tools: build_files_list, build_file_read, build_file_write and build_file_edit for the project's files (paths relative to the project folder, e.g. app/src/main.rs), and build_command_run for commands, which run in app/ (never start dev servers or watchers). Where the steps below mention Read, Write, Edit or Bash, use these. For the checklist step use build_checklist (the same shape as TodoWrite: todos with content, activeForm and status) and call it again as you go. You can't look at pictures: use capture/README.md, capture/capture.json and the evidence instead. Ask the person with core_person_ask only when a choice really changes the result. Other Craft Anything tools are available too; enable a toolset with enable_toolset when you need it. rebuild_check isn't available in this loop: Craft Anything checks your build after each turn instead.";
+const API_BUILDER: &str = "Your tools: build_files_list, build_file_read, build_file_write and build_file_edit for the project's files (paths relative to the project folder, e.g. app/src/main.rs), and build_command_run for commands, which run in app/ (never start dev servers or watchers). Where the steps below mention Read, Write, Edit or Bash, use these. For the checklist step use build_checklist (the same shape as TodoWrite: todos with content, activeForm and status) and call it again as you go. Ask the person with core_person_ask only when a choice really changes the result. Other Craft Anything tools are available too; enable a toolset with enable_toolset when you need it. rebuild_check isn't available in this loop: Craft Anything checks your build after each turn instead.";
+
+/// Added to the API loop's note for a builder that can't look at pictures.
+const BLIND_BUILDER: &str = " You can't look at pictures: use capture/README.md, capture/capture.json and the evidence instead.";
 
 /// Added to a refinement for a builder that can check its own work.
 const CHECK_BEFORE_REPLYING: &str = " Before you reply, check your build again with rebuild_check and fix what it still lists.";

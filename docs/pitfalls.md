@@ -56,6 +56,12 @@ added an app the new rule rejected; both were green on their own branch.
   #664, merged next, tested a button on that list without picking the tab. Checking that two PRs
   merge cleanly isn't checking that their tests pass together: run the UI tests on the merge.
 
+**A table row kept twice by a merge.** Two PRs edited the same STATUS.md row; resolving the
+conflict kept both versions, so five rows reached `main` twice, each copy with a different
+update, and the three OpenCode rows disagreed on whether SSH runs get the tools. When a
+conflict is in a table row, merge the edits into one row, and after merging look for a row
+name that appears twice.
+
 **A dependency change merged without its lockfile.** Changes were staged with
 `git add -A crates apps docs`, which leaves out the root `Cargo.lock`, so a new dependency reached
 `main` without its lock entry. Stage by `git add -A` (then review `git status`), or list `Cargo.lock`
@@ -161,6 +167,12 @@ Negative probes use loopback port zero so another fixture cannot acquire a relea
 A controlled fragmented request reproduced the fixture defect; the old CI log did not preserve
 the probe's underlying error, so it does not establish that failure's cause.
 
+**A socket option set after the peer reset it.** A preview test set its clients' read timeout
+after stopping the server. macOS answers `setsockopt` with `Invalid argument` on a socket closed in
+both directions (a reset, or the peer's FIN after our own `shutdown(Write)`); Linux doesn't check,
+so the test failed only on Macs. Set socket options right after connecting, before anything can
+close the connection.
+
 **A script written and run at once.** Tests that write a stand-in program and start it failed now
 and then on Linux with "Text file busy": another test thread was starting a child at that moment,
 and the child still held the new file open for writing. Starting a program goes through
@@ -170,6 +182,11 @@ instead.
 **Proving a refactor changed nothing.** Unit tests that check substrings can miss changed prompts.
 For a refactor that must keep output identical, dump the outputs for every combination before and
 after and compare them byte for byte (done for every brief across 162 combinations in R1.1).
+
+**A guard phrase that matched the wording it protects.** A test that no blind builder is told to
+"look at the picture" failed on the new "you can't look at the pictures in reference/". Make a
+forbidden phrase the instruction's exact words, check each one still appears in what the other
+case is sent (or the guard goes stale without failing), and break the code once to see it fail.
 
 **A Windows-only test that no check ran.** #748 added a second Antigravity folder to the search
 path; the Windows test that counts those folders wasn't updated, and `main` stayed green because CI
@@ -313,6 +330,20 @@ code that never compiled (#399). A failed build command is an `Ok` tool result (
 so counting tool errors misses it. Cap a loop on what it is stuck on (build commands failing in a
 row, read from the typed `succeeded` field), not only on its total steps.
 
+**A context overflow that looked like a broken request.** Ollama fits a prompt that is too long
+for its context by dropping the oldest messages, keeping the system prompt; the person's request
+went first, and a Qwen 3.8 model refused the rest with 500 "no user query found in messages"
+(#1245). It read as a fault in our request, and as a server error it was retried three times. The
+error came from Ollama's source (`server/prompt.go`, `model/renderers/qwen35.go`), not from the
+words: when a local server's error makes no sense for the request sent, read what the server does
+to it first, and mark a refusal that can't change on retry with a typed field (`context_overflow`).
+
+**A limit left unset is the largest one.** We sent OpenRouter no `max_tokens`, so it held the
+model's whole output limit (131,072 tokens for Kimi K3.1 Pro) against the key's credit, and a key
+with $35 left of its daily limit was refused with 402 before the model ran (#1213). When a service
+bills or reserves by a request's limits, find out what it assumes when one is missing; when it says
+what it can afford, ask again within that.
+
 **A router that picks the provider for you.** OpenRouter sends each request to one of several
 upstream providers, and a provider without tool calling answered 400 "Provider returned error"
 (#369), which said nothing the person could act on. For a service that routes, say in the request
@@ -444,6 +475,17 @@ edit, right before committing.
 
 ## Design
 
+**A round of checks that nothing could stop.** The builder's own checks ran one after another on
+the build's thread with no time limit, Pause was looked at only between tool calls, and the feed
+said only "checking its work against the original" for the whole round, so a check that stalled
+named no check and could hold the build for hours. Give a builder's checks a round time limit,
+look at Pause before each check, and say each check as its own step. The limit must reach the
+checks' own program runs too: a build step (a game engine's import, a cold compile) makes no tool
+call, so a limit that only applies "at the next tool call" leaves exactly the step that hangs.
+A check that's cut off is a failed check with its reason, never a silent wait. And every way a
+run can end — including a caught bug — records the project's status: leaving the last status on
+disk ("Checking" while nothing runs) reads as a stuck build that can't be retried.
+
 **An early error without a terminal event.** Model validation returned after reporting an error,
 but headless chat waits for `TurnDone`, not just an idle worker. Preflight failures and cancellation
 must finish the event sequence too; regression tests check both the error/status and the terminal event.
@@ -527,6 +569,13 @@ run's environment, so the builder ran without our tools and fell back to calling
 V2 also names a tool call `id` (V1: `callID`), so every tool event was dropped and the feed stayed empty
 for the whole turn. Use a file in `OPENCODE_CONFIG` with `run --standalone`, and confirm a live run
 reached the server (`mcp connected server=craft-anything` in OpenCode's log), not just that it started.
+
+**A side door to a service the main path avoided.** Runs used `--standalone` so OpenCode's shared
+service never saw them, and #1185 deleted the sessions a stopped turn left. But the model check
+before each turn ran plain `api model.list`, which starts that service, and the service resumed a
+session the person had left unfinished days before and went on editing another project for half
+an hour. When a program has a mode that must be avoided, give every call to it the same flag, not
+only the main one: list each command we run (`run`, `api`, `session delete`) and test each.
 
 **Keywords that only some code paths honour.** "…in Rust" picked Rust for apps but not for games, so
 a headless game rebuild stopped at once for want of Unity. It was found only by a live run. Run the
@@ -625,6 +674,11 @@ on Windows (`write_atomic`); show errors where the person is looking.
 `env` values included, which can hold API keys; a tool's output reaches the journal and MCP
 clients. The journal only redacts by field name. When a setting can hold a secret, hide its value
 in every tool that prints settings, and test that it doesn't appear.
+
+**A secret check that matched a word inside a name.** `cargo xtask secrets` took any variable
+with `AUTH` in its name as a secret; git sets `GIT_AUTHOR_NAME` while the hook runs, so a contributor
+whose git name is their handle couldn't commit their own roadmap claim. Name the exceptions
+(`NOT_SECRET`) rather than loosening the word, and test both sides with a list of variables.
 
 **Secret files kept out only by one person's gitignore.** `.env` files and
 `.claude/settings.local.json` were ignored by a contributor's global gitignore, not the repo's, so
@@ -744,6 +798,12 @@ list: scan the folders people keep such things in (`KnownRoot`, by folder name, 
 levels down), and make an install use a copy already found outside our store. Test each layout
 (unzipped, cask, capitalised name) with temp folders, not the machine the test runs on.
 
+**A per-run id that a provider expects to be stable.** OpenCode Go refuses a request without
+`x-opencode-session` (#1225). The header was sent, but only for backends saved with an id, so
+backends from older versions or found from a key got a new id on every run. A fallback id for one
+run is a workaround, not a fix: give each saved provider backend its id once, at startup, before
+any session lock is held (`AiHub::ensure_session_id`), and test a restart keeps the same id.
+
 ## Agent tooling
 
 **Shared CLI efforts reached Claude unchanged.** Keep CLI-only levels available for agents, but
@@ -857,6 +917,14 @@ parser between JSON recovery and ReAct: count the opener, require a standalone c
 least that long, and reject an earlier matching close followed by more text. Shorter backtick
 lines inside a longer fence are content. Test both paths and the next HTTP request, including
 malformed suffixes and non-call JSON examples whose strings contain protocol markers.
+
+**A call the server couldn't read, taken for the answer.** A llama.cpp server turns a Qwen
+model's `<tool_call><function=…>` markup into a real call only when it names an offered tool;
+otherwise it hands the markup back as text. The loop read text with no call as the final
+answer, so a 512k-window build that called `web_search` stopped its turn after 3 minutes and
+failed its check. Text recovery that only knows the formats seen so far ends a turn silently on
+the next one: read a model's own call format, and when it names a tool it doesn't have, tell it
+so and name the ones it has, rather than ending.
 
 **A view that asked to be scrolled on every frame.** The command palette called `scroll_to_me` on
 the selected row each frame, so the wheel's scroll was pulled back to it at once and the list

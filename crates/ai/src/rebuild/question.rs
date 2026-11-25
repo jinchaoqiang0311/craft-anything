@@ -57,6 +57,12 @@ pub struct Answered {
     pub builder_notice: Option<String>,
 }
 
+/// Where a question's answer comes from: the builder's session only when the project has one for
+/// this mode (the caller filters it) and the adapter can continue it; otherwise the files.
+fn answered_from(session: Option<&str>, resumes: bool) -> AnsweredFrom {
+    if session.is_some() && resumes { AnsweredFrom::BuildersSession } else { AnsweredFrom::TheFiles }
+}
+
 /// Answer `question` about `ws` (see the module docs), with the person's `settings` (taken from
 /// the caller, which may hold the session: a tool does while it runs, so locking it here would
 /// wait forever). Blocks until it's answered, `cancel` is set, or [`WAIT`] passes: call it off
@@ -77,12 +83,14 @@ pub fn ask(
     let builder_notice = super::builder_replacement(&cfg, ws, None).map(|r| super::replaced_builder_notice(&r.saved, &r.used));
     let entry = builder_backend(&cfg, project_builder(&cfg, ws))?;
     let deep = settings.deep_mode;
+    super::refuse_deep_session_reuse_in_clean_room(ws, &entry.config.model, &entry.options.args, deep)?;
     let cli = |resume: Option<String>| -> Box<dyn Conversation> {
         let spec = CliSpec {
             question: true,
             deep,
             logs: logs.clone(),
             resume,
+            key: crate::cli_agents::acp::key_for(&hub.keys, &entry.config.model, &entry.config.name, entry.config.kind),
             preamble: Some(PREAMBLE.into()),
             ..CliSpec::new(entry.config.clone(), entry.options.clone(), false, Some(ws.root.clone()))
         };
@@ -90,14 +98,14 @@ pub fn ask(
     };
     let (mut conv, mut from): (Box<dyn Conversation>, AnsweredFrom) = match entry.config.kind {
         BackendKind::AgentCli => {
-            let session = ws.manifest.agent_session_for(&entry.config.model).map(str::to_string);
+            let session = ws.manifest.agent_session_for_mode(&entry.config.model, deep).map(str::to_string);
             if let Some(id) = session.as_deref() {
                 bring_back_session(ws, &entry, id);
             }
             // Only a native adapter that resumes can answer from a copy of the builder's chat.
             // Copilot's ACP question starts fresh, even when the project has a saved session id.
             let native_session = crate::cli_agents::adapter_for(&entry.config.model).resumes();
-            let from = if session.is_some() && native_session { AnsweredFrom::BuildersSession } else { AnsweredFrom::TheFiles };
+            let from = answered_from(session.as_deref(), native_session);
             let spec = CliSpec {
                 question: true,
                 deep,
@@ -170,6 +178,7 @@ fn forget_lost_session(root: &Path, lost: &str) -> Result<bool, ToolError> {
         return Ok(false);
     }
     now.manifest.agent_session = None;
+    now.manifest.agent_session_deep = None;
     now.save()?;
     Ok(true)
 }
@@ -288,6 +297,90 @@ mod tests {
         assert!(PREAMBLE.contains("may still be running"));
     }
 
+    /// The user-visible half of R2.9: a Deep session isn't used for a Clean room question, and an
+    /// adapter that can't resume answers from the files even when the mode matches.
+    #[test]
+    fn a_question_answers_from_the_session_only_in_the_mode_it_was_saved_in() {
+        let d = tempfile::tempdir().unwrap();
+        let mut ws = Workspace::create(d.path(), "Notes", "A notes app", TargetRef::None).unwrap();
+        ws.manifest.agent_session = Some("s1".into());
+        ws.manifest.agent_session_by = Some("claude-code".into());
+        ws.manifest.agent_session_deep = Some(true);
+        let deep = ws.manifest.agent_session_for_mode("claude-code", true);
+        assert_eq!(answered_from(deep, true), AnsweredFrom::BuildersSession);
+        let clean = ws.manifest.agent_session_for_mode("claude-code", false);
+        assert_eq!(answered_from(clean, true), AnsweredFrom::TheFiles, "a Deep session isn't used in Clean room");
+        assert_eq!(answered_from(deep, false), AnsweredFrom::TheFiles, "an adapter that can't resume answers from the files");
+    }
+
+    /// R2.9 through `ask`: a Clean room question passes no resume to the agent and reports the
+    /// files; a Deep question with a Deep session resumes it. A saved `--resume`/`--continue` is
+    /// refused before the agent starts.
+    #[cfg(unix)]
+    #[test]
+    fn a_question_uses_the_session_only_in_the_mode_it_was_saved_in() {
+        use crate::{AiHub, BackendConfig, BackendEntry, BackendKind, BackendOptions, KeyStore};
+        use std::os::unix::fs::PermissionsExt;
+
+        fn ask_with(deep: bool, saved_args: bool) -> (Result<(Answered, String), ToolError>, bool) {
+            let d = tempfile::tempdir().unwrap();
+            let program = d.path().join("claude");
+            std::fs::write(&program, "#!/bin/sh\nd=$(dirname \"$0\")\nprintf '%s\\n' \"$@\" > \"$d/argv\"\ncat \"$d/reply.jsonl\"\n").unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::write(
+                d.path().join("reply.jsonl"),
+                "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"It is a notes app.\"}]}}\n{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"new-session\"}\n",
+            )
+            .unwrap();
+            let engine = Arc::new(Engine::new(craft_anything_engine::testing::session()));
+            let hub = AiHub::with_stores(engine, d.path().join("settings.toml"), KeyStore::file_only(d.path().join("keys.toml")));
+            let mut cfg = hub.config();
+            cfg.upsert(BackendEntry {
+                config: BackendConfig {
+                    name: "Claude".into(),
+                    kind: BackendKind::AgentCli,
+                    model: "claude-code".into(),
+                    base_url: None,
+                    ssh_host: None,
+                    enabled: true,
+                },
+                options: BackendOptions {
+                    command: Some(program.display().to_string()),
+                    args: if saved_args { vec!["--resume".into(), "deep-session".into()] } else { Vec::new() },
+                    ..Default::default()
+                },
+            });
+            hub.engine.session().settings.ai = cfg.to_table().unwrap();
+            let mut settings = hub.engine.session().settings.clone();
+            settings.deep_mode = deep;
+            let mut ws = Workspace::create(d.path(), "Notes", "A notes app", TargetRef::None).unwrap();
+            ws.manifest.agent_session = Some("deep-session".into());
+            ws.manifest.agent_session_by = Some("claude-code".into());
+            ws.manifest.agent_session_deep = Some(true);
+            ws.save().unwrap();
+            let answered = ask(&hub, &settings, None, &ws, "What is it?", &CancelToken::default());
+            let argv = std::fs::read_to_string(d.path().join("argv")).unwrap_or_default();
+            let spawned = !argv.is_empty();
+            (answered.map(|a| (a, argv)), spawned)
+        }
+
+        let (clean, clean_spawned) = ask_with(false, false);
+        assert!(clean_spawned, "Clean room spawns the agent");
+        let (clean, clean_argv) = clean.unwrap();
+        assert_eq!(clean.from, AnsweredFrom::TheFiles);
+        assert!(!clean_argv.lines().any(|a| a == "--resume" || a == "deep-session"), "{clean_argv:?}");
+
+        let (deep, deep_spawned) = ask_with(true, false);
+        assert!(deep_spawned, "Deep spawns the agent");
+        let (deep, deep_argv) = deep.unwrap();
+        assert_eq!(deep.from, AnsweredFrom::BuildersSession);
+        assert!(deep_argv.lines().any(|a| a == "--resume") && deep_argv.lines().any(|a| a == "deep-session"), "{deep_argv:?}");
+
+        let (err, spawned) = ask_with(false, true);
+        assert!(!spawned, "refused before the agent starts");
+        assert!(err.unwrap_err().message.contains("saved in Deep mode"), "the guard's message");
+    }
+
     /// A question that finds the builder's session missing forgets it, unless a build has saved
     /// another meanwhile: then that one stays.
     #[test]
@@ -295,17 +388,22 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let mut ws = Workspace::create(d.path(), "Notes", "A notes app", TargetRef::None).unwrap();
         ws.manifest.agent_session = Some("gone".into());
+        ws.manifest.agent_session_deep = Some(true);
         ws.manifest.last_reply = "Built it.".into();
         ws.save().unwrap();
         assert!(forget_lost_session(&ws.root, "gone").unwrap());
         let now = Workspace::open(&ws.root).unwrap();
         assert_eq!(now.manifest.agent_session, None);
+        assert_eq!(now.manifest.agent_session_deep, None, "the mode goes with the session");
         assert_eq!(now.manifest.last_reply, "Built it.", "nothing else changes");
 
         ws.manifest.agent_session = Some("new-from-a-build".into());
+        ws.manifest.agent_session_deep = Some(false);
         ws.save().unwrap();
         assert!(!forget_lost_session(&ws.root, "gone").unwrap());
-        assert_eq!(Workspace::open(&ws.root).unwrap().manifest.agent_session.as_deref(), Some("new-from-a-build"));
+        let kept = Workspace::open(&ws.root).unwrap();
+        assert_eq!(kept.manifest.agent_session.as_deref(), Some("new-from-a-build"));
+        assert_eq!(kept.manifest.agent_session_deep, Some(false), "a session a build saved since keeps its mode");
 
         assert!(forget_lost_session(&d.path().join("no-such-project"), "gone").is_err(), "an error, never a panic");
     }

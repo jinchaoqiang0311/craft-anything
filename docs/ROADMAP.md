@@ -181,12 +181,20 @@ Owner: maintainers · Status: in progress
 - [x] Address PR #1030 review: take the heartbeat baseline after stopping, guard the descendant
       stand-in against direct ignored-test runs, and document the test helpers
       — claimed: Codex, branch bugfix/r5.2-watched-launch-tests
-- [ ] `regression_preview_limits_connections_and_releases_listener` (platform) fails on macOS
+- [x] `regression_preview_limits_connections_and_releases_listener` (platform) fails on macOS
       with `Invalid argument` in its socket fixture, also reported before PR #1030's review fixes.
-      Investigate the fixture separately from the watched descendant shutdown test
+      The fixture set its excess clients' read timeout after dropping the server, and macOS
+      refuses socket options on a connection it has reset; the fixture now sets them when connecting
+      — PR #1207; claimed: rmsff, branch test/r5.2-macos-preview-socket-fixture
 Review comes before new work while the queue is long, smallest and clean PRs first. A PR is merged
 only when it's green and a maintainer has fully reviewed it, code as well as wording.
 - [ ] Maintainers: protect `main` (PRs required, squash only); the only ruleset covers `release`
+- [x] `cargo xtask secrets` treats every environment variable whose name contains `AUTH` as a
+      secret, git's `GIT_AUTHOR_NAME` among them, so the pre-commit hook refuses any added line with
+      the committer's own name when it's 12 characters or more (a roadmap claim by a contributor
+      whose git name is their handle). Leave git's identity variables out of `env_values`
+      (`NOT_SECRET`); `OAUTH`, `AUTHORIZATION` and other `AUTH` names are still checked
+      — claimed: youkaicountry, branch bugfix/r5.2-secrets-git-identity
 - [x] Auto mode's delete check is a safety bug that shows up as Mac test failures. It splits a
       command on spaces, so `rm -rf "C:/x/Game Backup/y"` from a project at `C:/x/Game` goes ahead
       unasked, and it lower-cases paths, so on a Mac or Linux a delete inside a project with
@@ -282,6 +290,16 @@ only when it's green and a maintainer has fully reviewed it, code as well as wor
 - [x] Limit the decision line above to what was measured (one RX 6900 XT, one driver, one Windows
       build) and say other Radeons and drivers aren't checked (#912 review)
       — claimed: 00xJS, branch docs/r5.2-radeon-idle-scope
+- [x] STATUS.md has rows twice, kept by squash merges of PRs that edited the same row: OpenCode
+      models and thinking (three copies that disagree about SSH), Claude desktop app without Claude
+      Code, Websites as targets, Desktop app and CLI; `docs/opencode.md` has a paragraph twice.
+      Keep the newest complete copy of each
+      — claimed: youkaicountry, branch docs/r5.2-doubled-status-rows — PR #1226
+- [ ] Have `cargo xtask` refuse a STATUS.md table with two rows of the same name, so a merge
+      that keeps both copies of an edited row fails CI instead of reaching `main`
+- [x] `docs/opencode.md` still has one passage twice, missed by #1226: in "Configuration and
+      execution", the older copy of the standalone-server sentence, cut off after "both"
+      — claimed: youkaicountry, branch docs/r5.2-opencode-doubled-passage
 
 ### R5.3 A builder that can't make progress stops
 Owner: open · Status: todo
@@ -368,6 +386,12 @@ been run live.
 - [x] Keep the retry condition when `Action:` or `Final Answer:` appears between fenced
       calls, without rejecting ordinary words between calls (PR #1031 review)
       — claimed: Codex, branch bugfix/r5.4-fenced-call-followup
+- [x] A call to a tool that isn't offered comes back from a llama.cpp server as text in Qwen's
+      markup (`<tool_call><function=web_search><parameter=query>…`), and the loop takes it as the
+      final answer: a live build on a 512k-window Qwen model stopped at its second check in 3
+      minutes. Read that markup as a call when it names an offered tool; when it names one that
+      isn't, say so and name the tools it has, and ask again
+      — claimed: youkaicountry, branch bugfix/r5.4-text-tool-calls
 - [ ] A local builder spends its rounds on the project file and never writes the app: run 4 had a
       compiling `Cargo.toml` by check 3, its last, with `main.rs` still "Hello, world!". See whether
       more rounds get there, or whether a small model needs the window and the `--screenshot`
@@ -414,8 +438,25 @@ been run live.
 - [ ] Find how each local server is told its context size and set it, or stop with a plain message
       when the prompt won't fit. We assume 24k and send no `num_ctx`, which an OpenAI-style endpoint
       may ignore anyway; LM Studio refused a 12.6k prompt on its 8k default (#73)
+- [x] A builder that can't see pictures (the API loop) is told it can't, then sent to open
+      screenshots with Read: the website capture lines and the `--screenshot` and reference-picture
+      lines in `brief.rs`, the website check's "Open each pair", the reminder after each round, the
+      `--screenshot` contract and `capture/README.md`'s window picture. Give it only what it can
+      use, and say what the check measures instead. `BriefCx::sees_pictures` (today: not the API
+      loop) picks the wording: a website's `layouts` and each round's `capture.json`, a program's
+      `ui-tree.json` and the check's likeness, and asking the person what their pictures show
+      — claimed: youkaicountry, branch bugfix/r5.4-blind-builder-prompts
+- [ ] The carry-on and follow-up prompts (`continue_prompt`, `follow_up`) ask an API-loop builder
+      to check its work with rebuild_check, which the loop refuses while it builds; only its first
+      message says so. Say "Craft Anything checks it after your turn" there instead
 - [x] When a server refuses a request for its context window and says the size (Ollama, llama.cpp,
       OpenAI-style), fit the conversation to that window and ask once more, else say how to raise it (#962)
+- [x] Ollama fits a long prompt to its context by dropping the oldest messages, and a Qwen 3.8 model
+      then refuses what's left with 500 "no user query found in messages" (#1245): say the context is
+      too small and how to raise it, and don't retry what can't fit
+      — claimed: justinjohn0306, branch bugfix/r5.4-ollama-dropped-request
+- [ ] Make room on its own after #1245's refusal: the server doesn't say its window, so this waits
+      for the window read from the server (#1155)
 - [x] A per-backend context budget in `[[ai.backends]]` (`LoopConfig::context_tokens` exists), for
       services whose real window differs from 150k (#374) — implementation: `6bd94b84828ec89b805cb8a246f557d0a778c037`
 - [x] Find LM Studio on another port (#73): the port in its settings file (when it is there) and
@@ -433,6 +474,12 @@ been run live.
       answer stream ended early." and no next step (seen once live, 27B model); say the server may
       still be loading it and to try again in a minute
       — claimed: yashpatadiya1724-cmyk, branch bugfix/r5.4-stream-loading-remediation
+- [x] An AI on this computer (Ollama, LM Studio) that can't be reached, or that took a request and
+      didn't start answering, is told apart: "Couldn't reach Ollama (local)" for a server that was
+      reached and "check your internet connection" for one on this computer misled, and an answer
+      that never started didn't say a large model may still be loading or reading a long prompt
+      (#1239 gave it the `timeout_secs` advice)
+      — claimed: jgt87, branch bugfix/r5.4-local-server-messages — PR #1242
 
 ### R5.5 API-key builds fail in words people can use
 Owner: open · Status: todo
@@ -464,6 +511,10 @@ Owner: open · Status: todo
       "400: Provider returned error" (#369): a request with tools now sets
       `provider.require_parameters`, and a 404 "no provider for these parameters" falls back to the
       text protocol like any server that rejects tools
+- [x] OpenRouter reserves a model's whole output limit against the key's credit when no `max_tokens`
+      is sent, so a key with $35 left of a daily limit got 402 "You requested up to 131072 tokens, but
+      can only afford 35063" (#1213): ask again once with the answer capped at what it can afford
+      — claimed: justinjohn0306, branch bugfix/r5.5-openrouter-afford-tokens
 - [x] A saved fal.ai key reaches an API-key build's asset tools; every call said "No fal.ai key"
       (#923). Outside a project the tools now say that instead. Not checked with a real fal.ai key
       or API build
@@ -523,6 +574,9 @@ yet, and the quick start is how every new person begins.
       within 90 s while the same check passed in the builder's turn and on a re-run; not
       reproduced. The app waited on animation frames, which a window behind others may not get;
       the Electron steps now say to capture after loading instead
+- [ ] A live Windows build whose check stalls (Codex, a Godot project, as in the reports): the
+      feed names the check it is in, the builder's own checks stop at their 30-minute limit,
+      Pause acts between checks and stops a running build step, and a caught bug leaves "Needs you"
 - [ ] A live chat run with a big comparison result, to see Claude Code page it with
       `core_evidence_browse` (and whether 80 KB is the right size)
 - [ ] Live check on Windows: rebuild a project while its frozen pin runs, and the build isn't
@@ -691,10 +745,51 @@ Owner: open · Status: in progress
       Reproduced the old failure on macOS; the AI suite now passes (446 passed, 2 ignored). PR #1018
       — claimed: Codex, branch test/r2.2-posix-remote-helper
 - [x] Find OpenCode's CLI inside its Windows desktop app (`opencode-cli.exe`), for detection and for runs (#1060)
+- [x] OpenCode Go gets one session id per installation, saved at startup for any saved Go backend, so
+      a restart keeps it (#1225). An OpenCode error without a message shows its name, status and the
+      start of its response body. Not run live; the run-5 cause in #1225 still needs its log.
+      — claimed: fabox-os, branch bugfix/1225-opencode-go-session
 - [ ] Settings → AI can only add an agent it detected: add one by choosing its program, for a CLI
       kept somewhere we don't look (#1060)
 - [ ] Verify OpenCode model discovery and an explicit thinking selection on a live SSH host,
       and complete a live generation with the selected model and variant (local catalogue verified).
+- [x] A stopped, failed or killed OpenCode turn deletes its session, so OpenCode's shared service
+      can't resume it and keep running the builder's commands later (#1115). Probed live with
+      OpenCode 2.2.5 on Windows: a killed `run --standalone` session stays `running` and the
+      service resumes it; `session delete --standalone` removes it without resuming it
+      — claimed: justinjohn0306, branch bugfix/r2.2-opencode-interrupted-sessions
+- [x] When Craft Anything itself is killed mid-turn (uninstalled, a crash; closing the app during a
+      build isn't known to wait for the delete either), no turn is left to delete the OpenCode
+      session, and the service still resumes it (#1115): each turn records its session under a
+      lock the system drops when the process ends; the next agent turn and
+      `craft-anything-cli uninstall` delete the sessions of records nobody holds. Over SSH, the
+      delete runs on the host too
+      — claimed: justinjohn0306, branch bugfix/r2.2-opencode-leftover-sessions
+- [ ] Sweep leftover agent sessions when the desktop app starts, not only at the next agent turn
+      or `craft-anything-cli uninstall` (#1115)
+- [ ] A turn stopped before OpenCode's first event leaves no session id to delete: OpenCode names its
+      session only in that event, so the session it may already have made stays (#1115, review on
+      #1176). Needs a session id known before the run (one we create and pass in), if OpenCode allows it
+- [x] OpenCode's model discovery (`api model.list`, run before every turn to check the chosen
+      model) has no `--standalone`, so it starts the shared service, and the service resumes any
+      unfinished session on the computer, in any project (#1115). Seen live with 2.2.5 on Linux: a
+      build's model check woke it, and a session left from days before went on editing another
+      project. Discover with a private server unless the person chose `--server`
+      — claimed: youkaicountry, branch bugfix/r2.2-opencode-discovery-standalone
+- [x] `docs/opencode.md` says "OpenCode V2" but not where to get it: OpenCode's install script
+      and npm's `opencode-ai` give the 1.x line, whose `run` has no `--standalone` (npm's
+      `@opencode/cli` is 2.x), so the check before a build
+      can't confirm it. Say where 2.x comes from and how to point the backend at it, and record
+      the Linux live runs in STATUS.md
+      — claimed: youkaicountry, branch docs/r2.2-opencode-live-findings — PR #1241
+- [ ] OpenCode's shared service, started while a `--standalone` run is going (opening the desktop
+      app does), takes over that run's session: both servers ran its commands, and the turn ended
+      with an error that had no details (seen live on Linux, a 2.2.6 service beside a 2.2.5 run).
+      Keep a run's session out of the service's reach, if OpenCode allows it; until then
+      `docs/opencode.md` says not to open OpenCode during a build
+- [ ] OpenCode logs "Received a progress notification for an unknown token" for our tool server
+      after calls through 2.x's `execute` (seen live on Linux, 2.2.5): check that our MCP server
+      sends progress only for a request that carried a `progressToken`, and only before its result
 
 "Found on this computer" has to mean "can do the job". Today only Claude Code gets everything.
 **Every builder gets the same tools:**
@@ -722,7 +817,12 @@ Owner: open · Status: in progress
       code) and a refusal explains the fix (`docs/codex.md`)
 - [ ] Codex (#540): run `codex exec` on a real install and check `rebuild_start` gets through
 - [ ] Codex: resume support (`codex exec resume <id>`), verified on a real install
-- [ ] Aider: move the message to `--message-file` once the launcher can write one (see the argv item above), and read project-folder `.aider.conf.yml` and `.env` in `check_setup`, which needs the working directory passed into `check_native_options`.
+- [ ] Aider: move the message to `--message-file` once the launcher can write one (see the argv item above).
+- [x] Aider: read project-folder `.aider.conf.yml` and `.env` in `check_setup`, which needs the working directory passed into `check_native_options`.
+      It reads the run's folder, the top of its git repository, then the home folder, as Aider
+      does — PR #1210; claimed: rmsff, branch feature/r2.2-aider-project-settings
+- [ ] Aider over SSH: its setup check still reads this computer's environment and home folder.
+      Read the remote host's `~/.env`, `~/.aider.conf.yml` and `~/.aider/oauth-keys.env` there
 - [ ] Every adapter but Claude Code's still takes the message in argv (`prompt_on_stdin`), so a long
       one can pass Windows' command-line limit as Claude Code's did (#402); hand each its message on
       stdin or in a file where its CLI reads one
@@ -773,6 +873,9 @@ Owner: open · Status: in progress
 - [ ] Over ACP, turns report 0 tokens: the protocol sends only `usage_update` (context used and
       size). Read real counts where an agent keeps them (Maki: `token_usage` in its session file
       under `~/.local/state/maki/sessions/`) or say the count is unknown instead of 0
+- [ ] Devin over ACP: `devin acp` asks the host to `authenticate` (`meta.api_key`) before
+      `session/new`, so the backend's stored key is sent — claimed: NibrasAz7, branch
+      feature/r2.2-devin-agent
 
 **Finding them:**
 - [ ] #105, #135, #259, #385 and #423 predate 0.3.0, which looks in more places, and came through
@@ -859,6 +962,11 @@ Owner: open · Status: in progress
       command that breaks it. The installed skill now warns against running `setup` on such an entry;
       `doctor` and `setup` should keep the person's extra arguments instead
       — claimed: 18923837179wjt-dot, branch fix/setup-skill-warns-before-setup-drops-all-tools
+- [x] Windows: a `.cmd` that only runs one `.exe` by its full path (`"C:\…\codex.exe" %*`, written
+      by hand or by another tool) was started through `cmd.exe`, which refuses an argument with a
+      line break ("batch file arguments are invalid"), expands `%` and caps the line at 8191
+      characters; that `.exe` is now started directly, as an npm shim's is (#1237)
+      — claimed: jgt87, branch bugfix/r2.2-cmd-wrapper-exe — PR #1238
 
 ### R2.4 Runtime study for apps and games (with consent)
 Owner: maintainers · Status: in progress
@@ -925,10 +1033,17 @@ Owner: open · Status: in progress
       working directory, preserving virtualenv paths for relative project placements — PR #950
 - [x] Launch a Go project with one `cmd/<name>/main.go` as a package when the root has no
       `main.go` — claimed: Afloat16, branch feature/r2.7-go-command-layouts
-- [ ] Extend launch recipes to Python package scripts and Java build outputs; build checks already
-      use their toolchain commands
+- [x] Launch the single installed console script of a Python project from its virtual environment
+      — claimed: Afloat16, branch feature/r2.7-python-console-entrypoint
+- [x] Extend launch recipes to Java build outputs and Python packages; build checks already use
+      their toolchain commands. A single `<name>/__main__.py` runs as `python3 -m <name>`, the
+      single runnable jar in `target/` or `build/libs/` with `java -jar` (Maven now builds with
+      `package`); build wrappers stay out of launch
+      — PR #1209; claimed: rmsff, branch feature/r2.7-python-java-launch
 - [ ] Audit relative project placements in build, option-run and Play paths too: runtime window
       capture now normalizes its request paths, but earlier runner paths can still be relative
+- [x] Resolve Godot's project argument and the local Electron binary and project argument before
+      starting either runner from a relative project folder — claimed: Afloat16, branch bugfix/r2.7-project-launch-paths
 - [x] "player" alone doesn't make a request a game: a video or music player is an app (#953)
       — claimed: justinjohn0306, branch bugfix/953-player-not-a-game
 - [x] System-tool and media-player phrases keep the app target: "a low level disk tool",
@@ -937,8 +1052,17 @@ Owner: open · Status: in progress
 
 ### R2.8 Clean room means clean room
 Owner: maintainers · Status: in progress
-- [ ] A remote (SSH) builder needs a craft-anything-cli that knows `--deep` and `--clean-room`:
-      check its version first and say so when it's older
+- [x] A remote (SSH) builder needs a craft-anything-cli that knows `--deep` and `--clean-room`.
+      Every release from 0.1.0 declares both as global flags and applies them in `mcp`, and has
+      `mcp --all-tools`, the only flags a remote tool server gets; a test fails when `mcp_for`
+      gives it another. Claude Code and Codex builds over SSH now check the host has
+      `craft-anything-cli` before starting, as OpenCode's did — PR #1211; claimed: rmsff, branch
+      test/r2.8-remote-cli-flags
+- [ ] A remote builder's `craft-anything-cli` should know `CRAFT_ANYTHING_AGENT` (#1022), which no
+      release up to 0.5.0 reads: there, a CLI the builder starts calls tools as the person. Today
+      that loosens nothing of the build's (the remote tool server has no project or inbox). Check
+      it before a build once a release has it: version numbers can't tell (`main` says 0.4.0), so
+      ask the CLI itself
 
 ### R2.9 Everyday use: typing, projects, settings
 Owner: maintainers · Status: in progress
@@ -999,9 +1123,30 @@ Gaps found while using the app for real projects.
       note's hand-over file carries the answers, and the after-turn path puts them before the
       notes; only answers the run's mode may show, marked told when read or sent
       — claimed: AlexJoaquimPereira, branch bugfix/r2.9-note-just-ask; commit 78d3963
-- [ ] Record which mode a builder's session ran in: `agent_session` is kept across modes, so a Clean
+- [x] Record which mode a builder's session ran in: `agent_session` is kept across modes, so a Clean
       room build or question can resume a session from a Deep build and carry what it read, and such
       a question's answer is recorded as asked in Clean room. Don't resume one for Clean room
+      — `agent_session_deep` in `craft.json` records it (one saved before the field counts as Deep);
+      a mismatch starts from the brief, and a question is answered from the files; tests cover both
+      directions and the legacy case. Claimed: AlexJoaquimPereira, branch bugfix/r2.9-session-mode
+- [x] The shared investigation chat (`SharedConversation`) doesn't continue a Deep chat's agent
+      session once the chat is in Clean room; Clean room to Deep still continues — claimed: rmsff,
+      branch fix/r2.9-shared-chat-mode
+- [x] A Clean room build or question must also not resume an API backend's kept transcript:
+      `ws.transcript_path()` is loaded whenever it exists, so switching modes can carry what a Deep
+      API build read. Clear it, or record its mode, when the mode changes; add a regression
+      — an API transcript records the mode it ran in (`TRANSCRIPT_VERSION` 2); one from the other
+      mode, or a version-1 one (counts as Deep), isn't resumed. A same-mode continuation keeps its
+      transcript and carries on; a mismatch studies again from the brief. Claimed:
+      AlexJoaquimPereira, branch bugfix/r2.9-api-transcript-mode
+- [ ] Study can still be skipped after a mode switch: a coding agent's `builder_started()` is
+      mode-unaware, and an API follow-up message with an existing capture leaves `first` false even
+      when the transcript was rejected. Gate both on the run's mode
+- [ ] A saved Claude `--resume`/`--continue` in the backend's extra arguments is refused in a
+      Clean room build or question when it would reuse the project's Deep session, leaving
+      unrelated arguments alone; unit and scripted CLI tests cover the build and question paths
+      (Clean room refuses, Deep allows), but no live signed-in Claude run is done, so this stays
+      open — claimed: AlexJoaquimPereira, branch bugfix/r2.9-saved-resume
 - [x] #504: the builder's plan card can be folded away with its X, or with `project_plan_fold`
       (between builds: a fold during a build can be overwritten by its next save). The steps stay
       in the conversation (`FEED_VERSION` 4, `FeedItem::PlanDismissed`), and a later run's
@@ -1105,6 +1250,21 @@ Gaps found while using the app for real projects.
       default fonts: without craft-fonts they show as boxes, and with it each such letter comes from
       Noto Sans CJK while the rest of the word is DM Sans. Bundle a DM Sans build that has the
       Vietnamese set (with its OFL notice) so Tiếng Việt renders in one face
+- [x] An engine download the server can't answer right now (a 5xx, 429) says to try again later,
+      not "update the pinned URL", which nobody installing an engine can do (#1193)
+      — claimed: justinjohn0306, branch bugfix/r2.9-download-server-errors
+- [x] Settings → AI: a card for an AI found on this computer wraps its description beside its Add
+      button; the line didn't wrap and ran on under the button
+      — claimed: jgt87, branch bugfix/r2.9-detected-cards-wrap — PR #1235
+- [x] The same action reads the same everywhere: a pin's menu said "Show folder" for what the project
+      page calls "Open folder" (both `project_open_folder`), and a game's chosen folder was shown as a
+      full path in its row, where other chosen folders are shortened, cut to fit and whole on hover
+      — claimed: jgt87, branch bugfix/r2.9-same-words-open-folder — PR #1243
+- [x] Colours, corners and text sizes off the theme in the chat, evidence, prompt box, sidebar,
+      palette and Just ask: the Send button's own white and black, two hand-set corner radii,
+      code at 12.5 pt where the rest is 12, an evidence summary at 13/15, and a question drawn in
+      the mode's default size where other card titles are 15 semibold
+      — claimed: jgt87, branch bugfix/r2.9-theme-tokens-type-scale — PR #1279
 
 ### R2.10 Pinned builds
 Owner: maintainers · Status: in progress
@@ -1131,6 +1291,13 @@ An open lane: anyone may take these at any time.
 ### R3.3 Frida sessions for real
 Owner: open · Status: todo
 - [ ] Replace the in-memory session bookkeeping with real attach, resume and detach
+- [x] The Frida and adb output parsers cut a 64 KiB line at a byte index, so a multibyte character
+      at the boundary keeps the whole line; cut at a character boundary and test both (#1095
+      follow-up) — a shared `capped_line` helper walks back to a character boundary; regression
+      tests cover both parsers and the helper
+      — claimed: AlexJoaquimPereira, branch bugfix/r3.3-engine-line-cap
+- [ ] `adb` `parse_ps` reads its header line before the 64 KiB cap, so a hostile header can
+      materialize a full token list; cap it like the body lines
 
 ### R3.9 Game assets out
 Owner: open · Status: in progress
@@ -1187,6 +1354,37 @@ Owner: open · Status: in progress
 
 ### R3.12 Format parser correctness
 Owner: open · Status: in progress
+- [x] Bound rejected ASAR names by the archive listing limit.
+      — claimed: Afloat16, branch bugfix/r3.12-asar-limit-bounds-20261107
+- [x] Keep .NET bundle member reads before the manifest.
+      — claimed: Afloat16, branch bugfix/r3.12-dotnet-data-bounds-20261107
+- [x] Check the decoded byte count for packed files whose manifest declares their original size.
+      — claimed: Afloat16, branch bugfix/r3.12-packed-member-size
+- [x] SQLite TEXT values cut at the 4 KiB cap can end in a spurious U+FFFD when the cut lands
+      inside a character; cut at a UTF-8/UTF-16 boundary and keep the `truncated` flag
+      — tests cover a UTF-8 character, a UTF-16 surrogate pair and a UTF-16 continuation-like
+      byte at the cut; invalid bytes keep their lossy prefix. Claimed: AlexJoaquimPereira,
+      branch bugfix/r3.12-sqlite-text-cap
+- [x] WITHOUT ROWID rows stored before ALTER TABLE ADD COLUMN show the added columns' defaults,
+      as rowid tables already do, instead of NULL.
+      — claimed: Plastic-time, branch bugfix/r3.12-sqlite-without-rowid-added-columns
+- [x] Fill added SQLite columns whose DEFAULT is a hex integer or a literal in parentheses
+      (`DEFAULT 0x10`, `DEFAULT (5)`); they show NULL with a note today. Hex integers keep
+      SQLite's 64-bit two's-complement value; one parenthesized literal is filled, while
+      expressions and nested parentheses stay unknown with the note.
+      — claimed: AlexJoaquimPereira, branch bugfix/r3.12-sqlite-added-defaults
+- [x] Give filled-in SQLite defaults their column's affinity, as SQLite reads them: a TEXT column
+      reads `DEFAULT 5` as '5' and `DEFAULT 007` as '7'; an INTEGER or NUMERIC column reads
+      `DEFAULT '7'` as 7 and `DEFAULT 5.0` as 5; a REAL column reads `DEFAULT '1.5'` as 1.5; a BLOB
+      or untyped column, and an ANY column in a STRICT table, keep the literal as written.
+      — claimed: Chr0mium24, branch bugfix/r3.12-sqlite-default-affinity
+- [ ] Fill added SQLite columns whose DEFAULT is a bare or double-quoted word (`DEFAULT abc`,
+      `DEFAULT "abc"`), a signed string (`DEFAULT -'5'`) or a number with digit separators
+      (`DEFAULT 1_000`); they show NULL with a note today.
+- [x] Whole numbers in SQLite REAL columns read as REAL: SQLite stores a REAL with no fractional
+      part as an integer and turns it back into a REAL when it reads the column, so a REAL, FLOAT
+      or DOUBLE column holding 1.0 shows 1.0 instead of 1.
+      — claimed: Chr0mium24, branch bugfix/r3.12-sqlite-real-affinity
 - [x] Require a complete DNS question's type and class fields before retaining it, and keep
       truncated questions out of packet inventories while reporting the incomplete message
       — claimed: Afloat16, branch bugfix/r3.12-dns-question-class-review-20261104
@@ -1194,6 +1392,10 @@ Owner: open · Status: in progress
       — claimed: Afloat16, branch bugfix/r3.12-ipv4-header-lengths-20261105
 - [x] Validate the version in IPv6 frames.
       — claimed: Afloat16, branch bugfix/r3.12-ipv6-version-20261105
+- [x] Reject negative GNU base-256 values in unsigned tar header fields.
+      — claimed: Afloat16, branch bugfix/r3.12-tar-octal-fields
+- [x] Recognize ZIP directories from DOS directory attributes and Unix file-type metadata when the entry name has no trailing slash.
+      — claimed: Afloat16, branch bugfix/r3.12-zip-directory-attributes
 - [x] Stop decoding extension headers inside noninitial IPv6 fragments.
       — claimed: Afloat16, branch bugfix/r3.12-ipv6-fragment-payload-20261105
 - [x] Enforce the expanded DNS name wire-length limit.
@@ -1202,6 +1404,8 @@ Owner: open · Status: in progress
       — claimed: Afloat16, branch bugfix/r3.12-dns-txt-truncation-20261105
       Preserve empty ANY/NONE UPDATE prerequisites with zero TTL; keep TXT validation scoped to parsed answers/prerequisites.
       Preserve empty multicast/unicast DNS-SD TXT records using wire-label service instance names.
+- [x] Validate DER algorithm identifiers, signature and key bit strings, and name fields before using them as certificate verification inputs.
+      — claimed: Afloat16, branch bugfix/r3.12-der-verification-fields
 - [x] Read HTTP Host fields only from the header section.
       — claimed: Afloat16, branch bugfix/r3.12-http-host-boundary-20261105
 - [x] Keep capture flow timestamps in chronological order.
@@ -1217,6 +1421,8 @@ Owner: open · Status: in progress
       — claimed: Afloat16, branch bugfix/r3.12-zip-multidisk-20261105
 - [x] Check Unity bundle blocks against their declared output lengths.
       — claimed: Afloat16, branch bugfix/r3.12-unity-bundle-decompressed-length-20261105
+- [x] Require terminated cpio pathnames and a complete, empty trailer before reporting an archive as complete.
+      — claimed: Afloat16, branch bugfix/r3.12-cpio-path-and-trailer
 - [x] Locate Unity bundle metadata within the declared bundle size.
       — claimed: Afloat16, branch bugfix/r3.12-unity-bundle-declared-size-20261105
 - [x] Check that Unity bundle compressed blocks end before the trailing block table, or the declared
@@ -1224,6 +1430,8 @@ Owner: open · Status: in progress
       — claimed: Codex, branch bugfix/r3.12-unity-bundle-data-region; PR #1021
 - [x] Reject Unity serialized objects outside their declared file.
       — claimed: Afloat16, branch bugfix/r3.12-unity-serialized-object-ranges-20261105
+- [x] Count WebAssembly locals across all declaration groups in retained function bodies.
+      — claimed: Afloat16, branch bugfix/r3.12-wasm-locals
 - [x] Preserve compression method slots in Unreal pak indexes.
       — claimed: Afloat16, branch bugfix/r3.12-unreal-pak-compression-slots-20261105
 - [x] Require complete terminators in Unreal FString values.
@@ -1232,32 +1440,81 @@ Owner: open · Status: in progress
       — claimed: Afloat16, branch bugfix/r3.12-iostore-unaligned-chunk-blocks-20261105
 - [x] Reject truncated IoStore fixed headers.
       — claimed: Afloat16, branch bugfix/r3.12-iostore-complete-header-20261105
+- [x] Reject CBOR collections that exceed the EVM metadata reader's limits and invalid text strings.
+      — claimed: Afloat16, branch bugfix/r3.12-evm-cbor
 - [x] Reject invalid marshal long integer digits.
       — claimed: Afloat16, branch bugfix/r3.12-pyc-long-limb-validation-20261105
 - [x] Check expanded RGBA image sizes and enforce output budgets before allocation.
       — claimed: Afloat16, branch bugfix/r3.12-pixel-rgba-output-overflow-20261105
+- [x] Report malformed safetensors metadata, element widths and payload coverage.
+      — claimed: Afloat16, branch bugfix/r3.12-safetensors-layout
 - [x] Count empty tensor shapes consistently across axis orders.
       — claimed: Afloat16, branch bugfix/r3.12-tensor-zero-dimension-product-20261105
 - [x] Find APK signatures through valid ZIP comments and framed central directories.
       — claimed: Afloat16, branch bugfix/r3.12-apk-sign-eocd-comment-boundary-20261105
+- [x] Read 16-bit native pointers without consuming adjacent bytes.
+      — claimed: Afloat16, branch bugfix/r3.12-binary-pointer
 - [x] Keep Mach-O load-command facts within their command.
       — claimed: Afloat16, branch bugfix/r3.12-macho-load-command-framing-20261105
+- [x] Keep native address translations and reads inside both the mapped range and its file-backed bytes.
+      — claimed: Afloat16, branch bugfix/r3.12-binary-padding
 - [x] Keep Mach-O function starts within their declared payload.
       — claimed: Afloat16, branch bugfix/r3.12-macho-function-starts-payload-boundary-20261105
+- [x] A Mach-O executable's entry point comes from the segment whose file bytes hold its
+      `LC_MAIN` offset. A segment with no file bytes, such as a `__DATA` that holds only
+      zero-fill sections, records file offset 0 like `__TEXT`, and the entry was placed in that
+      segment instead of in `__TEXT` (`/bin/cat` reads 0x100008588 for 0x100000588).
+      — claimed: Chr0mium24, branch bugfix/r3.12-macho-entry-zero-fill
+- [x] Decode binary plist markers and dictionary keys according to their stored types.
+      — claimed: Afloat16, branch bugfix/r3.12-bplist-typed-objects
+- [x] Visit XML plist values only inside a complete, correctly encoded document.
+      — claimed: Afloat16, branch bugfix/r3.12-xml-plist-document
+- [x] Name code-directory flags with the bits Apple uses: hard 0x100, kill 0x200, expires 0x400,
+      restrict 0x800, enforcement 0x1000, library-validation 0x2000. The table used 0x4–0x80 for
+      them and named 0x200 and 0x800 as other flags, so a library-validation signature (0x2000)
+      showed no flag names and 0x12200 read "allowed-entitlements,runtime".
+      — claimed: Chr0mium24, branch bugfix/r3.12-codesign-flag-names
 - [x] Keep code-signature children and verification reads within their declared superblob.
       — claimed: Afloat16, branch bugfix/r3.12-codesign-superblob-length-boundary-20261105
+- [x] Refuse short ELF64 header and section records and handle section-table offsets at the address limit safely.
+      — claimed: Afloat16, branch bugfix/r3.12-sbpf-records
 - [x] Keep PE optional-header reads within the declared header.
       — claimed: Afloat16, branch bugfix/r3.12-pe-optional-header-framing-20261105
+- [x] Keep relocation symbol indices inside a linked symbol table and require a linked string table before reporting a syscall name.
+      — claimed: Afloat16, branch bugfix/r3.12-sbpf-symbols
 - [x] Keep PE resource metadata within the resource directory.
       — claimed: Afloat16, branch bugfix/r3.12-pe-resource-directory-boundary-20261105
+- [x] Keep PE version strings whose value is empty (stored with no value at all), such as
+      `OleSelfRegister`, whose presence is the whole point.
+      — claimed: Plastic-time, branch bugfix/r3.12-pe-empty-version-strings
+- [x] Read PE version strings stored as binary (wType 0), which some linkers write; they're
+      dropped today (`FileDescription` in `pthreadVC2.dll`). A binary leaf at the string depth is
+      decoded as UTF-16LE; a binary node with children stays a container.
+      — claimed: AlexJoaquimPereira, branch bugfix/r3.12-pe-binary-version-strings
+- [x] Decode inline source-map data URLs without treating their URL fragments as payload; recognize case-insensitive scheme and base64 markers.
+      — claimed: Afloat16, branch bugfix/r3.12-source-map-data-url-fragment
+- [x] Accept only valid WebAssembly names when reporting custom-section debug and source map URLs.
+      — claimed: Afloat16, branch bugfix/r3.12-wasm-debug-names
+- [x] Decode the full signed 32-bit source map VLQ range and refuse mapping fields outside it.
+      — claimed: Afloat16, branch bugfix/r3.12-sourcemap-vlq-range
 - [x] Keep Go function tables and names within their section.
       — claimed: Afloat16, branch bugfix/r3.12-go-pclntab-section-boundary-20261105
+- [x] Keep the report's function display limit from marking a valid large WebAssembly module as mismatched.
+      — claimed: Afloat16, branch bugfix/r3.12-wasm-function-count
 - [x] Preserve complete Unicode characters in shortened .NET strings.
       — claimed: Afloat16, branch bugfix/r3.12-dotnet-user-string-surrogate-limit-20261105
+- [x] Read a Dart ELF build ID only when its name and descriptor fit the declared note.
+      — claimed: Afloat16, branch bugfix/r3.12-dart-note
 - [x] Locate ELF core mapping names after the complete declared table.
       — claimed: Afloat16, branch bugfix/r3.12-elf-core-file-name-count-cap-20261105
+- [x] Validate index source map section offsets and stop an unresolved section from borrowing mappings from the preceding section.
+      — claimed: Afloat16, branch bugfix/r3.12-index-map-boundaries
 - [x] Keep DOS relocations inside the declared executable header.
       — claimed: Afloat16, branch bugfix/r3.12-dos-relocation-header-boundary-20261105
+- [x] Keep relocation reads within their declared entry stride and never invent an addend for a truncated RELA.
+      — claimed: Afloat16, branch bugfix/r3.12-sbpf-rela
+- [x] Use the sorted section and segment boundaries during source-map position lookups so repeated symbolication visits only matching positions.
+      — claimed: Afloat16, branch bugfix/r3.12-source-map-lookup-work
 - [x] Parsers refuse what they used to half-read: binary plists keep objects inside their object
       area and reject unrepresentable widths, base64 (plists, source maps) refuses damaged tails
       and incomplete quanta through one shared decoder, OIDs must be minimally encoded, and string
@@ -1265,6 +1522,12 @@ Owner: open · Status: in progress
       PAX sizes across other metadata records; CRC cpio checks member data; source maps decode
       percent-escaped data URLs and report indexed-map columns in the generated file
       (#606–#615, by Afloat16)
+- [x] Report truncated SquashFS metadata blocks and retain previously recovered blocks.
+      — claimed: Afloat16, branch bugfix/r3.12-squashfs-metadata-warning
+- [x] Bound filesystem and archive recovery by the recorded image, node, directory and member limits.
+      — claimed: Afloat16, branch bugfix/r3.12-filesystem-archive-bounds
+- [x] Exercise signed PAX lengths, empty keys and equals signs inside a path value.
+      — claimed: Afloat16, branch bugfix/r3.12-pax-record-framing
 - [x] Bound and cancel CRC cpio verification across firmware probes, and reject non-hex checksum
       fields — claimed: Afloat16, branch bugfix/r3.12-bound-cpio-crc-scans-20261103
 - [x] More parsers keep to the bytes they declare and refuse impossible values: signed LEB128 past
@@ -1277,7 +1540,16 @@ Owner: open · Status: in progress
       TCP, pcapng and TLS lengths (#688–#715, by Afloat16)
 - [x] Check ClientHello vector lengths and extension values before reporting the handshake as complete.
       — claimed: Afloat16, branch bugfix/r3.12-tls-client-hello-values
+- [x] SQLite tables whose quoted name holds a parenthesis (`"export (1)"`) keep their columns,
+      rowid alias and WITHOUT ROWID order: the column list opens at the first parenthesis outside
+      quotes.
+      — claimed: Plastic-time, branch bugfix/r3.12-sqlite-parenthesized-table-names
+- [x] A comment after a SQLite column list that holds `)` (`... WITHOUT ROWID /* ) */`) still hides
+      the WITHOUT ROWID marker: find the list's closing parenthesis by tokens, not `rfind(')')`.
+      — claimed: Chr0mium24, branch bugfix/r3.12-sqlite-options-after-comment
 
+- [x] Keep Android binary XML events within their document, chunk and attribute bounds.
+      — claimed: Afloat16, branch bugfix/r3.12-android-xml-events
 - [x] Address the combined parser review: preserve partial Java reference coverage,
       enforce DEX signed 32-bit LEB128 limits, recover legacy AAPT UTF-8 lengths within
       their pool with a shared recovery probe limit, and distinguish missing ext indirect
@@ -1292,9 +1564,43 @@ Owner: open · Status: in progress
       — claimed: Afloat16, branch bugfix/r3.12-dns-rdata-names-review-20261104
 - [x] Keep address and service records attached to their owner and validate the record's wire fields.
       — claimed: Afloat16, branch bugfix/r3.12-dns-record-evidence
+- [x] Resolve keyed archive references consistently in nested objects and object rows.
+      — claimed: Afloat16, branch bugfix/r3.12-keyed-archive-references
+- [x] Accept binary plist arrays and sets that name one stored value many times; repeated data and
+      text spend a byte budget, and containers past the node cap are refused before reserving space.
+      — claimed: Plastic-time, branch bugfix/r3.12-plist-shared-array-values
+- [x] SQLite column names read whole when quoted: a doubled quote inside one stands for a quote,
+      and single-quoted names (which SQLite accepts) lose their quotes. Keys that name such columns
+      find them, so rowid aliases and WITHOUT ROWID order hold.
+      — claimed: Plastic-time, branch bugfix/r3.12-sqlite-quoted-column-names
+- [x] SQLite rows keep each value on its own column when a table has VIRTUAL generated columns:
+      SQLite computes those when a row is read and stores no field for them, so they show as not
+      read (with a note) instead of shifting later values onto the wrong columns, in rowid and
+      WITHOUT ROWID tables alike.
+      — claimed: Chr0mium24, branch bugfix/r3.12-sqlite-virtual-generated-columns
+- [x] A SQLite CREATE TABLE longer than 4 KiB is read whole. The schema walk cut it at the 4 KiB
+      text cap, so the columns after the cut weren't listed, a rowid alias read NULL, a WITHOUT
+      ROWID table showed no rows, and the defaults of columns added later weren't filled.
+      — claimed: Chr0mium24, branch bugfix/r3.12-sqlite-long-create-table
+- [x] Comments in a SQLite CREATE TABLE stay out of its columns: a comma or quote in a comment
+      doesn't split or swallow definitions, a comment before or right after a name isn't part of
+      it, and a comment inside a definition isn't part of its type, so INTEGER PRIMARY KEY still
+      marks the rowid alias.
+      — claimed: Plastic-time, branch bugfix/r3.12-sqlite-create-table-comments
+- [x] Keep the comma inside a SQLite type's parentheses: `DECIMAL(10, 2)` is listed as
+      `DECIMAL(10 2)`. The type keeps the comma inside its parentheses, and the schema overview
+      shows it unchanged. — claimed: AlexJoaquimPereira, branch bugfix/r3.12-sqlite-type-comma
+- [x] Asset catalogs name each rendition key attribute as CoreUI reads it. When the deployment
+      target predates an attribute (display gamut before macOS 10.12), actool writes a stand-in
+      (the placeholder attribute) in KEYFORMAT and the real one in KEYFORMATWORKAROUND, which
+      isn't read: the key format lists `placeholder` and a Display P3 variant's key shows
+      `placeholder: 1` instead of `display-gamut: 1`.
+      — claimed: Chr0mium24, branch bugfix/r3.12-car-key-format-workaround
 
 ### R3.13 Web inspection correctness
 Owner: open · Status: in progress
+- [x] Read HAR captures with the permitted UTF-8 byte order mark.
+      — claimed: Afloat16, branch bugfix/r3.13-har-bom-bounds-20261107
 - [x] The HTML scanner finds script preloads in `rel` token lists, decodes asset URLs once (numeric
       and named references), keeps script and title text through lookalike closing tags, and skips
       raw-text elements, markup inside attribute values and custom tag names such as

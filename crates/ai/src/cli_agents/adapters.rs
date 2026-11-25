@@ -9,6 +9,7 @@ mod aider;
 mod antigravity;
 mod codebuddy;
 mod copilot;
+mod devin;
 mod dsh;
 mod grok;
 mod hermes;
@@ -19,6 +20,7 @@ pub use aider::Aider;
 pub use antigravity::Antigravity;
 pub use codebuddy::CodeBuddy;
 pub use copilot::Copilot;
+pub use devin::Devin;
 pub use dsh::DeepSeekHarness;
 pub use grok::Grok;
 pub use hermes::Hermes;
@@ -75,7 +77,8 @@ pub trait AgentAdapter: Send + Sync {
     }
     /// Refuse options that the native transport cannot support, before preflight or process I/O.
     /// Saving a model choice and discovering its catalogue do not imply native execution support.
-    fn check_native_options(&self, _options: &BackendOptions) -> Result<(), ToolError> {
+    /// `cwd` is the folder the agent will run in on this computer; none for a run over SSH.
+    fn check_native_options(&self, _options: &BackendOptions, _cwd: Option<&Path>) -> Result<(), ToolError> {
         Ok(())
     }
 
@@ -250,6 +253,19 @@ pub trait AgentAdapter: Send + Sync {
     fn in_folder(&self, _folder: std::path::PathBuf) -> Option<Arc<dyn AgentAdapter>> {
         None
     }
+    /// Remove session `id` that a turn run with `program` left unfinished (stopped, failed or timed
+    /// out), so nothing the agent keeps running in the background picks it up again and goes on
+    /// working after we stopped it (#1115). `host`: the SSH host it ran on, None for this computer.
+    /// Default: this agent leaves nothing that resumes by itself.
+    fn discard_unfinished(&self, _program: &str, _id: &str, _host: Option<&str>) -> Result<(), ToolError> {
+        Ok(())
+    }
+    /// Whether [`discard_unfinished`](Self::discard_unfinished) really deletes sessions. Only then
+    /// is a turn's session recorded for a later sweep, and only then does a sweep take a record's
+    /// session as deleted (the default's `Ok` deletes nothing).
+    fn discards_sessions(&self) -> bool {
+        false
+    }
 }
 
 /// The adapters a run can use.
@@ -271,7 +287,7 @@ impl Default for AgentAdapters {
 }
 
 impl AgentAdapters {
-    /// The built-in coding agents, including the ACP-only Copilot and Grok Build adapters.
+    /// The built-in coding agents, including the ACP-only Copilot and Grok Build adapters and Devin's.
     pub fn built_in() -> AgentAdapters {
         AgentAdapters {
             adapters: vec![
@@ -286,6 +302,7 @@ impl AgentAdapters {
                 Arc::new(Copilot),
                 Arc::new(Grok),
                 Arc::new(DeepSeekHarness),
+                Arc::new(Devin),
                 Arc::new(CodeBuddy::default()),
                 Arc::new(TraeCode),
             ],
@@ -419,6 +436,10 @@ impl AgentAdapter for ClaudeCode {
 
     fn check_tool_server(&self, stop: &CancelToken) -> Result<(), ToolError> {
         cli_can_start(craft_anything_platform::self_cli_path().as_deref(), stop)
+    }
+
+    fn check_remote_tool_server(&self, host: &str, stop: &CancelToken) -> Result<(), ToolError> {
+        remote_check(host, Some(stop))
     }
 
     fn model_in_use(&self, options: Option<&BackendOptions>) -> Option<String> {
@@ -787,6 +808,10 @@ impl AgentAdapter for Codex {
         cli_can_start(craft_anything_platform::self_cli_path().as_deref(), stop)
     }
 
+    fn check_remote_tool_server(&self, host: &str, stop: &CancelToken) -> Result<(), ToolError> {
+        remote_check(host, Some(stop))
+    }
+
     fn args(&self, cx: &ArgsCx) -> Vec<String> {
         let mut v = vec!["exec".to_string(), "--json".into()];
         // Project folders aren't git repositories, and `codex exec` refuses to run outside one
@@ -965,4 +990,46 @@ impl AgentAdapter for GeminiCli {
         }
         out
     }
+}
+
+/// One `ssh` run for a remote set-up step. Never interactive (`BatchMode`, stdin closed).
+fn ssh_run(host: &str, line: &str, timeout: std::time::Duration, stop: Option<&CancelToken>) -> Result<craft_anything_platform::Output, ToolError> {
+    let argv = crate::ssh::ssh_line_args(host, line.to_string());
+    let mut proc = craft_anything_platform::process::Process::new("ssh").args(&argv).timeout(timeout).stdout_cap(64 * 1024);
+    if let Some(stop) = stop {
+        let stop = stop.clone();
+        proc = proc.cancel_when(move || stop.is_cancelled());
+    }
+    proc.run()
+}
+
+/// `command -v` only promises a nonzero status for a missing program: 127 is the shell's own "not
+/// found", which [`crate::ssh::diagnose`] turns into how to install it or put it on the PATH.
+pub(super) const REMOTE_CHECK_LINE: &str = "command -v craft-anything-cli >/dev/null || exit 127";
+
+/// The remote helper is on PATH, checked before a build starts (the remote server runs it). For
+/// every agent that's handed our tool server over SSH, as the local check is for one here.
+fn remote_check(host: &str, stop: Option<&CancelToken>) -> Result<(), ToolError> {
+    let out = ssh_run(host, REMOTE_CHECK_LINE, std::time::Duration::from_secs(15), stop)?;
+    if out.success {
+        return Ok(());
+    }
+    Err(remote_failure(host, &out))
+}
+
+/// Map the remote failure onto the fix, reusing the ssh failure wording other remote runs use.
+pub(super) fn remote_failure(host: &str, out: &craft_anything_platform::Output) -> ToolError {
+    if let Some(failure) = crate::ssh::diagnose(host, "craft-anything-cli", crate::ssh::is_git_server(host), out.code, out.stderr_text().as_str()) {
+        return ToolError::new(ErrorCode::EngineMissing, format!("Craft Anything can't set up its tools on {host}: {}.", failure.what))
+            .with_remediation(failure.fix);
+    }
+    let stderr = out.stderr_text();
+    let snippet: String = stderr.trim().chars().take(200).collect();
+    let exit = out.code.map_or_else(|| "it was stopped".to_string(), |code| format!("exit {code}"));
+    ToolError::new(ErrorCode::EngineMissing, format!("Craft Anything couldn't set up its tools on {host}: ssh didn't come back as expected ({exit})."))
+        .with_remediation(if snippet.is_empty() {
+            "Check that craft-anything-cli is on the PATH this ssh session uses, and that the host lets you run programs over ssh.".to_string()
+        } else {
+            format!("ssh said: {snippet}")
+        })
 }

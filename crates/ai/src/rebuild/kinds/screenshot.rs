@@ -13,10 +13,11 @@ use craft_anything_engine::workspace::Claim;
 use craft_anything_platform::process::Process;
 
 /// What every app and game brief asks for, so the check can see the result.
-pub const SCREENSHOT_CONTRACT: &str = "Give the program a `--screenshot <file.png>` option: start normally, draw about 120 frames, save the window's picture as a PNG to that file and exit. Craft Anything runs it that way after each build to check the result, and a build without the option, or with a blank picture, doesn't pass. Try it yourself: run it with a file inside app/ (for example app/shots/now.png) and look at the picture.";
+pub const SCREENSHOT_CONTRACT: &str = "Give the program a `--screenshot <file.png>` option: start normally, draw about 120 frames, save the window's picture as a PNG to that file and exit. Craft Anything runs it that way after each build to check the result, and a build without the option, or with a blank picture, doesn't pass. Try it yourself: run it with a file inside app/ (for example app/shots/now.png) and check that it saves the picture.";
 
 /// Include the shared catalogue's supported entrypoints so the builder knows how checks start it.
-pub fn contract() -> String {
+/// A builder that can look at pictures is also told to look at its own.
+pub fn contract(sees_pictures: bool) -> String {
     let entries = craft_anything_engine::toolchains::catalogue()
         .iter()
         .filter(|t| !t.launch.is_empty())
@@ -24,7 +25,8 @@ pub fn contract() -> String {
         .collect::<Vec<_>>()
         .join("; ");
     format!(
-        "{SCREENSHOT_CONTRACT} If not packaging an executable, keep a supported entrypoint directly in app/ ({entries}); wildcard entrypoints must match exactly one file."
+        "{SCREENSHOT_CONTRACT}{} If not packaging an executable, keep a supported entrypoint directly in app/ ({entries}); wildcard entrypoints must match exactly one file.",
+        if sees_pictures { " Then open it with Read and look at it." } else { "" }
     )
 }
 
@@ -308,8 +310,13 @@ pub(super) fn run_with(cx: &CheckCx, option: &str, file: &Path) -> Result<OwnRun
     let _ = std::fs::remove_file(file);
     let mut with = args.clone();
     with.extend(option_args(godot.is_some() && app.join("project.godot").is_file(), option, file));
-    let stop = cx.stop().clone();
-    let out = Process::new(&program).args(&with).cwd(&app).timeout(RUN_LIMIT).stdout_cap(256 * 1024).cancel_when(move || stop.is_cancelled()).run();
+    // A round with a time limit (the builder's own checks) cuts this run at the limit, instead of
+    // waiting out its own 90 s. A pause stops it now, and neither a pause nor a passed limit ever
+    // starts the program.
+    let stop = cx.stop();
+    let timeout = stop.time_left().map_or(RUN_LIMIT, |left| RUN_LIMIT.min(left));
+    stop.check()?;
+    let out = Process::new(&program).args(&with).cwd(&app).timeout(timeout).stdout_cap(256 * 1024).cancel_when(move || stop.paused()).run();
     let Ok(bytes) = std::fs::read(file) else {
         let why = match &out {
             Ok(o) if !o.success => {

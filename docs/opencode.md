@@ -4,9 +4,6 @@ Craft Anything can run OpenCode V2 locally or on an SSH host. OpenCode owns its 
 connections and sign-in. Set these up in OpenCode on the computer where it will run.
 
 Model and thinking choices can be discovered, validated and saved. A run with an explicit
-selection goes through the native adapter (`opencode run --standalone`), which hands a local run
-the Craft Anything MCP server in a config file named by `OPENCODE_CONFIG`; the person's own
-settings stay unchanged. Over SSH the native run has no Craft Anything tools yet.
 selection goes through the native adapter (`opencode run --standalone`), which hands the run
 the Craft Anything MCP server in a config file named by `OPENCODE_CONFIG`; the person's own
 settings stay unchanged. Over SSH one `ssh` run checks that `craft-anything-cli` is on the
@@ -14,6 +11,19 @@ remote PATH and writes the file on the host itself (`~/.cache/craft-anything/`, 
 content, kept private), so the remote run gets the same tools. The host needs
 `craft-anything-cli` on its PATH — install Craft Anything there (the app keeps the helper
 next to it). If the check fails, the turn stops before any work with the fix.
+
+**Which OpenCode.** Runs need OpenCode 2.x, whose `run` has `--standalone`. OpenCode's install
+script and npm's `opencode-ai` package still give the 1.x line (1.19.5 on 2026-11-08), which
+doesn't have it. 2.x comes from npm's `@opencode/cli` package (`npm install -g @opencode/cli`),
+with the OpenCode desktop app, whose CLI is `opencode-cli` in the app's resources folder
+(`/opt/OpenCode/resources/opencode-cli` from the Linux package), and from OpenCode's GitHub
+releases. When the `opencode` on your PATH is 1.x, install `@opencode/cli`, or point the backend
+at a 2.x CLI: step 2 below, or `craft-anything-cli ai program OpenCode <path>`.
+
+**Don't start OpenCode during a build.** OpenCode's shared service resumes every session it finds
+running, including the one a build's private server is driving: started mid-build (opening the
+desktop app does it), it ran the builder's commands alongside the build, and the turn ended with
+an error that had no details. Open the desktop app before or after a build, not during one.
 
 ## Desktop
 
@@ -102,15 +112,28 @@ by recovery.
 The current ACP transport cannot select models or variants. An explicit choice bypasses ACP
 even if `acp = true` was previously set and runs natively. OpenCode V2 ignores
 `OPENCODE_CONFIG_CONTENT`, and plain `opencode run` hands the turn to the background service,
-which never sees the run's environment; so the adapter writes the server to a temp config file
-and starts a private server with `--standalone`. V2 names a tool call `id` (V1: `callID`); both
 which never sees the run's environment; so the adapter writes the server to a config file
 and starts a private server with `--standalone` (locally in this computer's temporary
 folder, over SSH on the host itself). V2 names a tool call `id` (V1: `callID`); both
 are read, so tool calls reach the feed while the turn runs.
 
+A `--standalone` turn still keeps its session in OpenCode's shared storage. If the turn is
+stopped part-way, the session stays `running`, and the background service picks it up the next
+time it starts and carries on with the builder's commands (#1115, seen with 2.2.5 on Windows).
+So a local turn that doesn't finish (stopped, failed or timed out) deletes its session with
+`opencode session delete --standalone <id>`, which removes it without resuming it (over SSH, on
+the host). A turn that finishes keeps its session. While a turn runs, its session is recorded in
+`logs/unfinished-sessions/` in the config folder, under a lock the system drops when Craft
+Anything ends; if Craft Anything is killed mid-turn, the next agent turn, or
+`craft-anything-cli uninstall`, deletes the session of any record nobody holds. A delete that
+keeps failing is given up after three tries, with the command to run by hand.
+
 Model discovery uses `opencode api model.list --param location[directory]=...` (the V2
 `GET /api/model` operation). This keeps credentials and configuration resolution inside OpenCode.
-Global `--server` and `--standalone` arguments are shared with discovery. Extra model arguments
+Global `--server` and `--standalone` arguments are shared with discovery. Without a `--server`,
+discovery adds `--standalone` itself, as runs do: plain `api` starts OpenCode's shared service,
+which resumes every unfinished session on the computer, in any project, and carries on with its
+commands (#1115). The model check before each turn is a discovery, so without it every build could
+wake an old session somewhere else. Extra model arguments
 remain available when no model or thinking selection is saved. With an explicit selection,
 conflicting extra model arguments are refused; choose the model through its settings instead.

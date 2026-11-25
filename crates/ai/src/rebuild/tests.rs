@@ -19,10 +19,10 @@ fn kind_of(request: &str, target: &TargetRef, stack: &str) -> &'static str {
     KindRegistry::built_in().detect(request, target, stack).unwrap().id()
 }
 fn brief(ws: &Workspace, k: &str, deep: bool, ghidra: bool, editor: Option<&Path>, assets: bool, extra: Option<&str>) -> String {
-    super::brief(kind(k).as_ref(), &BriefCx { ws, deep, ghidra, editor, assets, image_model: None }, extra)
+    super::brief(kind(k).as_ref(), &BriefCx { ws, deep, ghidra, editor, assets, image_model: None, sees_pictures: true }, extra)
 }
 fn refine(k: &str, check: &CheckResult) -> String {
-    kind(k).refine(check)
+    kind(k).refine(check, true)
 }
 fn follow_up(message: &str, k: &str) -> String {
     super::follow_up(message, kind(k).as_ref())
@@ -185,6 +185,38 @@ fn thai_requests_keep_their_project_kind() {
 }
 
 #[test]
+fn estonian_requests_keep_their_project_kind() {
+    for request in ["Lihtne usumäng", "Sama mäng, aga edetabeliga", "Loo mäng, mis mängib nii", "Loo mänge lastele"] {
+        assert_eq!(choose(request, &TargetRef::None), ("game", "Unity"), "{request}");
+    }
+    for request in ["Veebileht minu pagaritöökojale", "Loo see veebileht uuesti", "Veebileht minu töökojale"] {
+        assert_eq!(choose(request, &TargetRef::None), ("website", stacks::BUILDERS_CHOICE), "{request}");
+    }
+    assert_eq!(choose("Sama rakendus, aga lihtsam", &TargetRef::None).0, "app");
+    // A game noun keeps its kind in compounds and inflected forms; the verb "mängima" (to play)
+    // and toy compounds do not.
+    for request in ["Lauamäng", "Arvutimängu uus versioon"] {
+        assert_eq!(choose(request, &TargetRef::None).0, "game", "{request}");
+    }
+    for request in ["Loo muusikat mängiv rakendus", "Mänguasjapood"] {
+        assert_eq!(choose(request, &TargetRef::None).0, "app", "{request}");
+    }
+    // Punctuation and newlines still expose the website cues, and a browser is not a website.
+    for request in ["Loo:\nveebileht pagaritöökojale", "Kodulehele"] {
+        assert_eq!(choose(request, &TargetRef::None).0, "website", "{request}");
+    }
+    assert_eq!(choose("Ava veebilehitseja", &TargetRef::None).0, "app");
+    // The head of the main clause decides when both are named: a game used as the source or
+    // topic is not the build.
+    for request in ["Tee sellest mängust veebileht", "Mängude veebileht", "Loo veebileht, kus müüakse mänge", "Veebileht mängust"] {
+        assert_eq!(choose(request, &TargetRef::None).0, "website", "{request}");
+    }
+    for request in ["Tee sellest veebilehest mäng", "Loo mäng nimega Veebileht", "Mäng veebilehega"] {
+        assert_eq!(choose(request, &TargetRef::None).0, "game", "{request}");
+    }
+}
+
+#[test]
 fn chinese_requests_keep_their_project_kind() {
     for request in ["一个简单的贪吃蛇游戏", "簡單的貪食蛇遊戲", "复刻它的玩法"] {
         assert_eq!(choose(request, &TargetRef::None), ("game", "Unity"), "{request}");
@@ -336,7 +368,7 @@ fn engine_stacks_get_their_own_steps_checks_and_play() {
     assert!(stack_steps("Unreal Engine", Some(ed)).contains("Game.uproject"));
 
     let d = tempfile::tempdir().unwrap();
-    let stop = CancelToken::default();
+    let stop = CheckStop::default();
     assert_eq!(build_check(d.path(), "app/", "Unity", Some(ed), &stop), (false, "No Unity project found in app/ yet.".into()));
     assert_eq!(build_check(d.path(), "app/", "Godot", Some(ed), &stop), (false, "No Godot project (project.godot) found in app/ yet.".into()));
     assert!(build_check(d.path(), "app/", "Unreal Engine", Some(ed), &stop).1.contains(".uproject"));
@@ -418,13 +450,14 @@ fn notes_added_while_it_works_reach_the_agent_at_its_next_step() {
         editor: None,
         notes: notes.clone(),
         feed: Arc::new(Mutex::new(feed::FeedLog::open(&ws))),
+        keys: crate::KeyStore::file_only(ws.root.join("keys.toml")),
         assets: false,
         decompiled: false,
         usage: None,
         self_check: None,
         reset_progress_after_notes: false,
     };
-    assert!(w.added(&mut ws, true).is_none(), "nothing added, nothing to say");
+    assert!(w.added(&mut ws, true, true).is_none(), "nothing added, nothing to say");
     use craft_anything_engine::questions::{self, AskedQuestion};
     let asked = AskedQuestion { deep: false, ..AskedQuestion::new("where is the score kept".into(), "In src.".into(), true, "Stand-in".into(), None, 0) };
     questions::add(&ws, asked.clone()).unwrap();
@@ -432,7 +465,7 @@ fn notes_added_while_it_works_reach_the_agent_at_its_next_step() {
     let mut first = note(1, "Make it faster");
     first.questions = vec![asked];
     notes.lock().unwrap().extend([first, note(2, "A blue sky")]);
-    let (p, more) = w.added(&mut ws, true).unwrap();
+    let (p, more) = w.added(&mut ws, true, true).unwrap();
     assert!(p.contains("where is the score kept") && p.contains("- Make it faster (pictures: a.png)\n- A blue sky"), "{p}");
     assert_eq!(more.len(), 1, "the question is marked told after the turn");
     assert!(notes.lock().unwrap().is_empty(), "each note goes in once");
@@ -518,14 +551,104 @@ fn pictures_of_the_original_reach_the_builder() {
     let d = tempfile::tempdir().unwrap();
     let ws = Workspace::create(d.path(), "Game", "Copy this game", TargetRef::None).unwrap();
     assert!(!brief(&ws, "game", false, false, None, false, None).contains("reference/picture"));
-    assert!(pictures_reminder(&ws).is_empty());
+    assert!(pictures_reminder(&ws, true).is_empty());
     let pic = d.path().join("shot.webp");
     std::fs::write(&pic, "x").unwrap();
     ws.add_references(&[pic]).unwrap();
     let b = brief(&ws, "game", false, false, None, false, None);
     assert!(b.contains("reference/picture-1.webp") && b.contains("--screenshot"), "{b}");
     assert!(!brief(&ws, "website", false, false, None, false, None).contains("--screenshot"), "websites are photographed for it");
-    assert!(pictures_reminder(&ws).contains("1 picture(s)"));
+    assert!(pictures_reminder(&ws, true).contains("1 picture(s)"));
+}
+
+/// What a builder that can't look at pictures (the API loop) is told to open or look at a
+/// picture with. A sighted builder's prompts say these; a blind one's never do (R5.4).
+const LOOK_AT_A_PICTURE: &[&str] = &[
+    "Read tool and look",
+    "with the Read tool to learn the style",
+    "Open every one with the Read tool",
+    "open that picture with Read",
+    "Open each pair",
+    "open any you haven't looked at",
+    // The --screenshot contract's old wording, kept here so it can't come back for a blind builder.
+    "now.png) and look at the picture",
+    "open it with Read and look at it",
+    "from the pictures and how it plays",
+    "use the pictures in reference/",
+    "Work from these pictures",
+    "so match how they look",
+];
+
+fn said_to_look(text: &str) -> Option<&'static str> {
+    LOOK_AT_A_PICTURE.iter().copied().find(|p| text.contains(p))
+}
+
+/// R5.4: every first message, refinement and reminder a blind builder can get, for every kind,
+/// target, mode and with or without the person's pictures, sends it to no picture, and each says
+/// what to use instead.
+#[test]
+fn a_builder_that_cant_see_is_never_sent_to_a_picture() {
+    let sees_only = |ws: &Workspace, k: &str, deep: bool, assets: bool, sees_pictures: bool| {
+        super::brief(kind(k).as_ref(), &BriefCx { ws, deep, ghidra: false, editor: None, assets, image_model: None, sees_pictures }, None)
+    };
+    let mut checked = 0;
+    // Everything a sighted builder is sent, to show the guard's phrases are still what it's told.
+    let mut sighted_all = String::new();
+    for k in KindRegistry::built_in().ids() {
+        for target in ["none", "web", "local"] {
+            for (deep, assets, pics, generated) in (0..16).map(|b| (b & 1 != 0, b & 2 != 0, b & 4 != 0, b & 8 != 0)) {
+                let d = tempfile::tempdir().unwrap();
+                let t = match target {
+                    "web" => TargetRef::Website { url: "https://example.com".into() },
+                    "local" => TargetRef::Local { path: d.path().join("orig").join("game.exe") },
+                    _ => TargetRef::None,
+                };
+                let mut ws = Workspace::create(d.path(), "P", "Make it", t).unwrap();
+                ws.manifest.generate_assets = generated;
+                if pics {
+                    let p = d.path().join("shot.png");
+                    std::fs::write(&p, "x").unwrap();
+                    ws.add_references(&[p]).unwrap();
+                }
+                let case = format!("{k} {target} deep={deep} assets={assets} pictures={pics} generated={generated}");
+                let blind = sees_only(&ws, k, deep, assets, false);
+                assert_eq!(said_to_look(&blind), None, "{case}:\n{blind}");
+                sighted_all.push_str(&sees_only(&ws, k, deep, assets, true));
+                sighted_all.push_str(&pictures_reminder(&ws, true));
+                if pics {
+                    assert!(blind.contains("you can't look at pictures") && blind.contains("core_person_ask"), "{case}:\n{blind}");
+                    assert_eq!(said_to_look(&pictures_reminder(&ws, false)), None, "{case}");
+                    assert!(pictures_reminder(&ws, false).contains("you can't look at them"), "{case}");
+                }
+                if target == "web" && k == "website" {
+                    assert!(blind.contains("`layouts`") && !blind.contains("screenshot and `layouts`"), "{case}:\n{blind}");
+                }
+                if target == "local" && !deep {
+                    assert!(blind.contains("capture/ui-tree.json"), "{case}:\n{blind}");
+                }
+                checked += 1;
+            }
+        }
+        let mut c = CheckResult::new("x", 3, true, String::from("the note"));
+        assert_eq!(said_to_look(&kind(k).refine(&c, false)), None, "{k}");
+        c.similarity = Some(71.0);
+        let blind = kind(k).refine(&c, false);
+        assert_eq!(said_to_look(&blind), None, "{k}: {blind}");
+        if k == "website" {
+            assert!(blind.contains("checks/round-3/capture.json") && blind.contains("capture/capture.json"), "{blind}");
+        }
+        sighted_all.push_str(&kind(k).refine(&c, true));
+    }
+    assert!(checked >= 100, "only {checked} cases");
+    sighted_all.push_str(&super::kinds::screenshot::contract(true));
+    for phrase in LOOK_AT_A_PICTURE.iter().filter(|p| **p != "now.png) and look at the picture") {
+        assert!(sighted_all.contains(phrase), "{phrase:?} is no longer said to any builder: the guard is stale");
+    }
+    // The --screenshot contract, also sent inside a failed check's note.
+    assert_eq!(said_to_look(&super::kinds::screenshot::contract(false)), None);
+    assert_eq!(said_to_look(super::kinds::screenshot::SCREENSHOT_CONTRACT), None, "a check's note may reach a blind builder");
+    // The API loop's own note says it once; agent apps aren't told.
+    assert!(!API_BUILDER.contains("can't look at pictures") && BLIND_BUILDER.contains("can't look at pictures"));
 }
 
 mod typed_retries {
@@ -582,6 +705,7 @@ mod typed_retries {
         }
     }
 
+    /// A retryable CLI failure is retried without asking for a fresh external session.
     #[test]
     fn transient_failures_retry_without_requiring_an_external_session() {
         for saved in [false, true] {
@@ -592,7 +716,7 @@ mod typed_retries {
             let mut agent = FailingConversation::new([Some(failure), None], saved);
             agent.message = "Authentication and billing service restarting. Please retry in 90s.";
             let mut waits = Vec::new();
-            let result = worker.turn_with_wait(&mut ws, &mut agent, "Build the requested app", None, |_, seconds| {
+            let result = worker.turn_with_wait(&mut ws, &mut agent, "Build the requested app", true, None, |_, seconds| {
                 waits.push(seconds);
                 Ok(())
             });
@@ -604,6 +728,7 @@ mod typed_retries {
         }
     }
 
+    /// Typed setup errors stop at once, even when their text contains a retry hint.
     #[test]
     fn setup_errors_do_not_retry_even_with_a_wait_in_the_message() {
         for kind in [
@@ -619,12 +744,13 @@ mod typed_retries {
             let mut worker = check_worker(&ws, false);
             let mut agent = FailingConversation::new([Some(TurnFailure::new(kind))], true);
             agent.message = "需要修改设置。Please retry in 1s.";
-            let result = worker.turn_with_wait(&mut ws, &mut agent, "Build it", None, |_, _| panic!("a setup error must not wait and retry"));
+            let result = worker.turn_with_wait(&mut ws, &mut agent, "Build it", true, None, |_, _| panic!("a setup error must not wait and retry"));
             assert!(result.is_err(), "{kind:?}");
             assert_eq!(agent.sent.len(), 1, "{kind:?}");
         }
     }
 
+    /// Retries stop at the cap, and a cancelled wait sends no further turn.
     #[test]
     fn retries_are_bounded_and_cancelled_waits_send_nothing_more() {
         assert_eq!(RunOptions::default().max_rounds, 6, "room to keep fixing until it works");
@@ -636,7 +762,7 @@ mod typed_retries {
         let mut waits = Vec::new();
         assert!(
             worker
-                .turn_with_wait(&mut ws, &mut agent, "Build it", None, |_, seconds| {
+                .turn_with_wait(&mut ws, &mut agent, "Build it", true, None, |_, seconds| {
                     waits.push(seconds);
                     Ok(())
                 })
@@ -646,7 +772,7 @@ mod typed_retries {
         assert_eq!(waits, [30, 60, 90]);
         let mut agent = FailingConversation::new([Some(failure)], false);
         let error = worker
-            .turn_with_wait(&mut ws, &mut agent, "Build it", None, |stop, _| {
+            .turn_with_wait(&mut ws, &mut agent, "Build it", true, None, |stop, _| {
                 stop.cancel();
                 stop.check()
             })
@@ -726,7 +852,7 @@ mod typed_retries {
         let mut agent = RateLimited { sent: 0, first_poll: false };
         let mut waits = Vec::new();
         let error = worker
-            .turn_with_wait(&mut ws, &mut agent, "Build the app", None, |_, seconds| {
+            .turn_with_wait(&mut ws, &mut agent, "Build the app", true, None, |_, seconds| {
                 waits.push(seconds);
                 Ok(())
             })
@@ -737,6 +863,8 @@ mod typed_retries {
         assert!(error.message.contains(".answer.json"), "the original local failure is retained: {error:?}");
     }
 
+    /// A rate-limited API turn continues its history without repeating the person's message or
+    /// completed tools.
     #[test]
     fn an_api_rate_limit_continues_history_without_repeating_users_or_completed_tools() {
         use crate::agent::tests::{Scripted, turn};
@@ -769,7 +897,7 @@ mod typed_retries {
             let mut waits = Vec::new();
             assert_eq!(
                 worker
-                    .turn_with_wait(&mut ws, &mut api, "Build the notes app", None, |_, seconds| {
+                    .turn_with_wait(&mut ws, &mut api, "Build the notes app", true, None, |_, seconds| {
                         waits.push(seconds);
                         Ok(())
                     })
@@ -792,6 +920,7 @@ mod typed_retries {
         }
     }
 
+    /// Write an executable stand-in CLI and start a conversation with it.
     #[cfg(unix)]
     fn executable_cli(ws: &Workspace, model: &str, script: &str) -> crate::cli_agents::CliConversation {
         use std::os::unix::fs::PermissionsExt;
@@ -814,6 +943,7 @@ mod typed_retries {
     }
 
     #[cfg(unix)]
+    /// A failed required tool server stops the owned CLI instead of resuming its session.
     #[test]
     fn a_failed_required_tool_server_stops_the_owned_cli_without_resuming_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -830,7 +960,7 @@ mod typed_retries {
                 "sleep 5\nprintf 'unreachable' > continued-without-tools\n"
             ),
         );
-        let error = worker.turn_with_wait(&mut ws, &mut cli, "Build the app", None, |_, _| panic!("missing tools must not be retried")).unwrap_err();
+        let error = worker.turn_with_wait(&mut ws, &mut cli, "Build the app", true, None, |_, _| panic!("missing tools must not be retried")).unwrap_err();
         assert!(error.message.contains("tools did not start"), "{error:?}");
         assert_eq!(cli.last_failure().unwrap().kind, FailureKind::ToolsUnavailable);
         assert!(!cli.is_busy());
@@ -840,6 +970,7 @@ mod typed_retries {
     }
 
     #[cfg(unix)]
+    /// A plain CLI's non-zero exit is retried by resuming the session it saved.
     #[test]
     fn a_plain_nonzero_cli_exit_resumes_its_saved_session() {
         let dir = tempfile::tempdir().unwrap();
@@ -859,7 +990,7 @@ mod typed_retries {
             ),
         );
         let mut waits = Vec::new();
-        let result = worker.turn_with_wait(&mut ws, &mut cli, "Make a notes app", None, |_, seconds| {
+        let result = worker.turn_with_wait(&mut ws, &mut cli, "Make a notes app", true, None, |_, seconds| {
             waits.push(seconds);
             Ok(())
         });
@@ -874,6 +1005,7 @@ mod typed_retries {
     }
 
     #[cfg(unix)]
+    /// A typed setup error is reported ahead of a non-zero exit.
     #[test]
     fn typed_cli_setup_errors_take_precedence_over_a_nonzero_exit() {
         for (code, kind) in
@@ -885,7 +1017,7 @@ mod typed_retries {
             let error = json!({"type":"assistant","error":code,"message":{"content":[{"type":"text","text":"Please retry in 1s."}]}});
             let script = format!("#!/bin/sh\ncat >/dev/null\nprintf 'attempt\\n' >> attempts\nprintf '%s\\n' '{error}'\nexit 1\n");
             let mut cli = executable_cli(&ws, "claude-code", &script);
-            let result = worker.turn_with_wait(&mut ws, &mut cli, "Make a notes app", None, |_, _| panic!("typed setup failures must not retry"));
+            let result = worker.turn_with_wait(&mut ws, &mut cli, "Make a notes app", true, None, |_, _| panic!("typed setup failures must not retry"));
             assert!(result.is_err(), "{kind:?}");
             assert_eq!(cli.last_failure().unwrap().kind, kind);
             assert_eq!(std::fs::read_to_string(ws.root.join("attempts")).unwrap(), "attempt\n");
@@ -894,6 +1026,7 @@ mod typed_retries {
     }
 
     #[cfg(unix)]
+    /// OpenCode's typed rate limit is retried with the whole original request.
     #[test]
     fn opencode_retries_a_typed_rate_limit_with_its_whole_original_request() {
         let dir = tempfile::tempdir().unwrap();
@@ -915,7 +1048,7 @@ mod typed_retries {
         let mut waits = Vec::new();
         assert_eq!(
             worker
-                .turn_with_wait(&mut ws, &mut cli, "Make a notes app", None, |_, seconds| {
+                .turn_with_wait(&mut ws, &mut cli, "Make a notes app", true, None, |_, seconds| {
                     waits.push(seconds);
                     Ok(())
                 })
@@ -931,6 +1064,7 @@ mod typed_retries {
     }
 
     #[cfg(unix)]
+    /// An untyped OpenCode exit keeps its error and stops at the three-retry cap.
     #[test]
     fn an_untyped_opencode_exit_keeps_its_error_and_the_three_retry_cap() {
         let dir = tempfile::tempdir().unwrap();
@@ -943,7 +1077,7 @@ mod typed_retries {
         );
         let mut waits = Vec::new();
         let error = worker
-            .turn_with_wait(&mut ws, &mut cli, "Make a notes app", None, |_, seconds| {
+            .turn_with_wait(&mut ws, &mut cli, "Make a notes app", true, None, |_, seconds| {
                 waits.push(seconds);
                 Ok(())
             })
@@ -1109,7 +1243,8 @@ fn a_registered_kind_is_chosen_from_its_words_and_brings_its_checks() {
     let ws = Workspace::create(d.path(), "Deck", "Make slides", TargetRef::None).unwrap();
     let checks = kinds.get("slides").unwrap().checks(&ws);
     assert_eq!(checks.iter().map(|c| c.id()).collect::<Vec<_>>(), ["outline"]);
-    let b = super::brief(&SlidesKind, &BriefCx { ws: &ws, deep: false, ghidra: false, editor: None, assets: false, image_model: None }, None);
+    let b =
+        super::brief(&SlidesKind, &BriefCx { ws: &ws, deep: false, ghidra: false, editor: None, assets: false, image_model: None, sees_pictures: true }, None);
     assert!(b.contains("What to build: a slide deck."), "{b}");
 }
 
@@ -1222,6 +1357,7 @@ fn an_api_backend_builds_with_the_build_tools() {
         editor: None,
         notes: Arc::default(),
         feed: Arc::new(Mutex::new(feed::FeedLog::open(&ws))),
+        keys: crate::KeyStore::file_only(ws.root.join("keys.toml")),
         assets: false,
         decompiled: false,
         usage: None,
@@ -1241,7 +1377,7 @@ fn an_api_backend_builds_with_the_build_tools() {
     let slot = ModelSlot { name: "Scripted".into(), model: Box::new(script), local: false, effort: None, max_turns: 10, context_tokens: 0 };
     let enabled = std::collections::BTreeSet::from([craft_anything_engine::Toolset::Core, craft_anything_engine::Toolset::Build]);
     let mut api = ApiConversation::start_with(Arc::new(EngineHost(engine)), vec![slot], LoopConfig::default(), enabled).unwrap();
-    let reply = w.turn(&mut ws, &mut api, "Build it.", None).unwrap();
+    let reply = w.turn(&mut ws, &mut api, "Build it.", true, None).unwrap();
     assert_eq!(reply.trim(), "Built the notes app.");
     assert_eq!(std::fs::read_to_string(ws.app_dir().join("README.md")).unwrap(), "# Notes\n");
     assert!(ws.manifest.agent_session.is_none(), "an API loop has no session to resume");
@@ -1278,7 +1414,7 @@ fn other_pages_of_the_same_site_are_picked_from_its_links() {
     // The brief mentions the other pages only when some were captured.
     let d = tempfile::tempdir().unwrap();
     let ws = Workspace::create(d.path(), "Shop", "Clone it", TargetRef::Website { url: "https://shop.example.com/".into() }).unwrap();
-    let cx = |ws| BriefCx { ws, deep: false, ghidra: false, editor: None, assets: false, image_model: None };
+    let cx = |ws| BriefCx { ws, deep: false, ghidra: false, editor: None, assets: false, image_model: None, sees_pictures: true };
     assert!(kinds::WebsiteKind.brief_sections(&cx(&ws)).is_empty());
     std::fs::create_dir_all(ws.capture_dir()).unwrap();
     std::fs::write(ws.capture_dir().join(ROUTES_FILE), serde_json::to_vec(&r).unwrap()).unwrap();
@@ -1339,6 +1475,7 @@ fn the_mechanics_sheet_is_required_and_held_against_the_code() {
         editor: None,
         notes: Arc::default(),
         feed: Arc::new(Mutex::new(feed::FeedLog::open(&ws))),
+        keys: crate::KeyStore::file_only(ws.root.join("keys.toml")),
         assets: false,
         decompiled: false,
         usage: None,
@@ -2105,6 +2242,199 @@ mod picking_up_a_build {
         assert_eq!(Workspace::open(&ws.root).unwrap().manifest.agent_session.as_deref(), Some("session-1"));
     }
 
+    /// A resumable stand-in: records the session id the runner would continue.
+    struct ResumingStandIn {
+        seen: Arc<craft_anything_platform::sync::Mutex<Vec<Option<String>>>>,
+    }
+
+    impl crate::cli_agents::AgentAdapter for ResumingStandIn {
+        fn ids(&self) -> &'static [&'static str] {
+            &["stand-in"]
+        }
+        fn args(&self, cx: &crate::cli_agents::ArgsCx) -> Vec<String> {
+            self.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(cx.resume.map(str::to_string));
+            vec![cx.prompt.to_string()]
+        }
+        fn streams_json(&self) -> bool {
+            false
+        }
+        fn resumes(&self) -> bool {
+            true
+        }
+    }
+
+    /// R2.9: a session saved in one mode is never continued in the other — a Clean room build
+    /// must not carry what a Deep one read — and one saved before the mode was kept counts as
+    /// Deep, so only Deep continues it.
+    #[test]
+    fn a_session_from_another_mode_is_not_continued() {
+        for (saved, deep, continued) in [
+            (Some(true), true, true),
+            (Some(true), false, false),
+            (Some(false), false, true),
+            (Some(false), true, false),
+            (None, true, true),
+            (None, false, false),
+        ] {
+            let b = bench();
+            let mut ws = worked_on(&b);
+            ws.manifest.agent_session_deep = saved;
+            ws.save().unwrap();
+            b.hub.engine.session().settings.deep_mode = deep;
+            let seen = Arc::new(craft_anything_platform::sync::Mutex::new(Vec::new()));
+            let mut adapters = crate::cli_agents::AgentAdapters::built_in();
+            adapters.register(Arc::new(ResumingStandIn { seen: seen.clone() }));
+            let (ok, feed) = try_with(&b, &ws, RunOptions { adapters, ..Default::default() });
+            assert!(ok, "saved={saved:?}, deep={deep}: {feed:?}");
+            let told = std::fs::read_to_string(&b.prompts).unwrap();
+            assert_eq!(told.contains("Pick up where you left off"), continued, "saved={saved:?}, deep={deep}: {told}");
+            assert_eq!(told.contains("Their request"), !continued, "a fresh start gets the brief: {told}");
+            let expected = continued.then_some("session-1");
+            let seen = seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(!seen.is_empty(), "saved={saved:?}, deep={deep}: the stand-in ran");
+            assert!(seen.iter().all(|r| r.as_deref() == expected), "saved={saved:?}, deep={deep}: the runner got {seen:?}");
+        }
+    }
+
+    /// R2.9: a saved Claude `--resume` or `--continue` that would reuse the project's Deep session
+    /// is refused in Clean room; other agents' sessions, other ids, Deep runs and unrelated
+    /// arguments are left alone.
+    #[test]
+    fn a_saved_deep_session_in_claude_arguments_is_refused_in_clean_room() {
+        let d = tempfile::tempdir().unwrap();
+        let mut ws = Workspace::create(d.path(), "x", "A thing", TargetRef::None).unwrap();
+        ws.manifest.agent_session = Some("deep".into());
+        ws.manifest.agent_session_deep = Some(true);
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(refuse_deep_session_reuse_in_clean_room(&ws, "claude-code", &args(&["--resume", "deep"]), false).is_err());
+        assert!(refuse_deep_session_reuse_in_clean_room(&ws, "claude-code", &args(&["--resume=deep"]), false).is_err());
+        assert!(refuse_deep_session_reuse_in_clean_room(&ws, "claude-code", &args(&["-r", "deep"]), false).is_err());
+        assert!(refuse_deep_session_reuse_in_clean_room(&ws, "claude-code", &args(&["--resume", "other"]), false).is_ok());
+        assert!(refuse_deep_session_reuse_in_clean_room(&ws, "claude-code", &args(&["--resume", "deep"]), true).is_ok());
+        assert!(
+            refuse_deep_session_reuse_in_clean_room(&ws, "claude-code", &args(&["--resume", "other", "--resume", "deep"]), false).is_err(),
+            "any saved resume is checked"
+        );
+        assert!(refuse_deep_session_reuse_in_clean_room(&ws, "claude-code", &args(&["--continue"]), false).is_err());
+        assert!(refuse_deep_session_reuse_in_clean_room(&ws, "claude-code", &args(&["-c"]), false).is_err());
+        assert!(refuse_deep_session_reuse_in_clean_room(&ws, "claude-code", &args(&["--continue"]), true).is_ok());
+        assert!(refuse_deep_session_reuse_in_clean_room(&ws, "codex", &args(&["--resume", "deep"]), false).is_ok(), "only Claude's flag is checked");
+        ws.manifest.agent_session_by = Some("codex".into());
+        assert!(
+            refuse_deep_session_reuse_in_clean_room(&ws, "claude-code", &args(&["--resume", "deep"]), false).is_ok(),
+            "another agent's session isn't Claude's"
+        );
+        ws.manifest.agent_session_by = None;
+        ws.manifest.agent_session_deep = None;
+        assert!(refuse_deep_session_reuse_in_clean_room(&ws, "claude-code", &args(&["--resume", "deep"]), false).is_err(), "a legacy session counts as Deep");
+    }
+
+    /// R2.9: the build path itself refuses a saved Deep resume in Clean room and allows it in
+    /// Deep, so removing the guard from `agent_spec` fails this test.
+    #[test]
+    fn the_build_path_refuses_a_saved_deep_resume_in_clean_room() {
+        let d = tempfile::tempdir().unwrap();
+        let mut ws = Workspace::create(d.path(), "x", "A thing", TargetRef::None).unwrap();
+        ws.manifest.agent_session = Some("deep".into());
+        ws.manifest.agent_session_by = Some("claude-code".into());
+        ws.manifest.agent_session_deep = Some(true);
+        ws.save().unwrap();
+        let entry = crate::BackendEntry {
+            config: crate::BackendConfig {
+                name: "Claude".into(),
+                kind: BackendKind::AgentCli,
+                model: "claude-code".into(),
+                base_url: None,
+                ssh_host: None,
+                enabled: true,
+            },
+            options: crate::BackendOptions { args: vec!["--resume".into(), "deep".into()], ..Default::default() },
+        };
+        let clean = check_worker(&ws, false);
+        let err = clean.agent_spec(&ws, &entry, &RunOptions::default()).unwrap_err();
+        assert!(err.message.contains("saved in Deep mode"), "{}", err.message);
+        let deep = check_worker(&ws, true);
+        assert!(deep.agent_spec(&ws, &entry, &RunOptions::default()).is_ok(), "a Deep run may resume its session");
+    }
+
+    /// Add the local API backend the transcript tests start.
+    fn local_api(b: &Bench) {
+        b.hub
+            .add_backend(
+                crate::BackendConfig {
+                    name: "Local".into(),
+                    kind: BackendKind::OpenaiCompatible,
+                    model: "test-model".into(),
+                    base_url: Some("http://127.0.0.1:0/v1".into()),
+                    ssh_host: None,
+                    enabled: true,
+                },
+                None,
+            )
+            .unwrap();
+    }
+
+    /// R2.9: a continuation keeps its API transcript, so the run can recognize completed Study
+    /// work; a genuinely fresh build still starts a new conversation.
+    #[test]
+    fn an_api_continuation_keeps_its_transcript_and_a_fresh_build_drops_it() {
+        let b = bench();
+        local_api(&b);
+        let ws = worked_on(&b);
+        std::fs::write(ws.transcript_path(), b"{}").unwrap();
+        let run = RebuildRun::start(&b.hub, Workspace::open(&ws.root).unwrap(), RunOptions { backend: Some("Local".into()), ..RunOptions::default() }).unwrap();
+        assert!(ws.transcript_path().is_file(), "a continuation keeps the conversation");
+        drop(run);
+
+        let b = bench();
+        local_api(&b);
+        let fresh = Workspace::create(&b.projects, "fresh", "Build a notes app", TargetRef::None).unwrap();
+        std::fs::write(fresh.transcript_path(), b"{}").unwrap();
+        let run = RebuildRun::start(
+            &b.hub,
+            Workspace::open(&fresh.root).unwrap(),
+            RunOptions { backend: Some("Local".into()), message: Some("Build a notes app".into()), ..RunOptions::default() },
+        )
+        .unwrap();
+        assert!(!fresh.transcript_path().exists(), "a fresh build starts a new conversation");
+        drop(run);
+    }
+
+    /// R2.9: an API transcript from the other mode isn't "carrying on", so a no-message run still
+    /// studies as a fresh one instead of skipping the Deep study.
+    #[test]
+    fn an_api_transcript_from_the_other_mode_is_not_carried_on() {
+        let d = tempfile::tempdir().unwrap();
+        let ws = Workspace::create(d.path(), "x", "A thing", TargetRef::None).unwrap();
+        let mut opts = RunOptions::default();
+        assert!(!super::super::is_carrying_on(&opts, &ws, true), "nothing is under way yet");
+        std::fs::write(ws.transcript_path(), b"{}").unwrap();
+        assert!(super::super::is_carrying_on(&opts, &ws, true), "a transcript in this mode is carried on");
+        assert!(!super::super::is_carrying_on(&opts, &ws, false), "another mode's transcript is not");
+        opts.message = Some("change it".into());
+        assert!(!super::super::is_carrying_on(&opts, &ws, true), "a new request isn't carrying on");
+        opts.message = None;
+        opts.continuing = true;
+        assert!(super::super::is_carrying_on(&opts, &ws, true), "an explicit resume in this mode is");
+        assert!(!super::super::is_carrying_on(&opts, &ws, false), "one in another mode is not");
+    }
+
+    /// A saved session records the mode it ran in, and a lost one clears both.
+    #[test]
+    fn a_session_is_kept_with_the_mode_it_ran_in() {
+        let d = tempfile::tempdir().unwrap();
+        let mut ws = Workspace::create(d.path(), "x", "A thing", TargetRef::None).unwrap();
+        Worker::remember_session(&mut ws, Some("s1".into()), false).unwrap();
+        let m = Workspace::open(&ws.root).unwrap().manifest;
+        assert_eq!((m.agent_session.as_deref(), m.agent_session_deep), (Some("s1"), Some(false)));
+        Worker::remember_session(&mut ws, Some("s2".into()), true).unwrap();
+        let m = Workspace::open(&ws.root).unwrap().manifest;
+        assert_eq!((m.agent_session.as_deref(), m.agent_session_deep), (Some("s2"), Some(true)));
+        Worker::remember_session(&mut ws, None, true).unwrap();
+        let m = Workspace::open(&ws.root).unwrap().manifest;
+        assert_eq!((m.agent_session, m.agent_session_deep), (None, None), "a lost session leaves no mode behind");
+    }
+
     #[test]
     fn a_new_project_still_starts_from_the_top() {
         let b = bench();
@@ -2210,6 +2540,27 @@ fn just_ask_is_told_to_the_builder_shortly_and_cut_on_a_character() {
     assert!(super::just_asked(&longest).encode_utf16().count() < 20_000);
 }
 
+/// A run that ends by a caught bug must not leave the saved status as it last was ("Checking"
+/// while nothing runs), so the project looks stuck. Every ending records a status.
+#[test]
+fn a_caught_bug_leaves_a_status_the_person_can_act_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ws = Workspace::create(dir.path(), "x", "Build an app", TargetRef::None).unwrap();
+    let panicked: Result<Result<String, ToolError>, Box<dyn std::any::Any + Send>> = Err(Box::new("boom"));
+    let (ok, message, paused) = super::run_outcome(panicked, &mut ws);
+    assert!(!ok && !paused && message.contains("hit a bug"), "{message}");
+    let saved = Workspace::open(&ws.root).unwrap();
+    assert_eq!(saved.manifest.status, Status::NeedsYou, "a project can't be left saying Checking with nothing running");
+    assert!(saved.manifest.note.contains("hit a bug"), "{}", saved.manifest.note);
+    // A pause is not a failure.
+    let (ok, message, paused) = super::run_outcome(Ok(Err(ToolError::cancelled())), &mut ws);
+    assert!(!ok && paused && message == "Paused.");
+    assert_eq!(Workspace::open(&ws.root).unwrap().manifest.status, Status::Stopped);
+    // A finished run keeps the status the run itself set.
+    let (ok, message, paused) = super::run_outcome(Ok(Ok("Ready.".into())), &mut ws);
+    assert!(ok && !paused && message == "Ready.");
+}
+
 /// #923: with OpenRouter as the builder, every asset call said "No fal.ai key" with one saved. The
 /// project hasn't turned on generated assets, so nothing is sent or spent.
 #[test]
@@ -2248,6 +2599,7 @@ fn check_worker(ws: &Workspace, deep: bool) -> Worker {
         usage: None,
         self_check: None,
         reset_progress_after_notes: false,
+        keys: crate::KeyStore::file_only(ws.root.join("keys.toml")),
     }
 }
 
@@ -2570,7 +2922,7 @@ fn a_resumed_game_builder_hears_the_asset_choice_as_it_is_now() {
     let mut ws = Workspace::create(d.path(), "Game", "A snake game", TargetRef::None).unwrap();
     let game = kind("game");
     fn cx(ws: &Workspace, assets: bool) -> BriefCx<'_> {
-        BriefCx { ws, deep: false, ghidra: false, editor: None, assets, image_model: None }
+        BriefCx { ws, deep: false, ghidra: false, editor: None, assets, image_model: None, sees_pictures: true }
     }
     assert!(game.follow_up_sections(&cx(&ws, true)).is_empty(), "off and never used: nothing to say");
     // Turned on after the first build, with a key: the follow-up carries the asset note and budget.
@@ -2715,6 +3067,7 @@ fn preparing_the_builders_agent_does_not_lock_up() {
         editor: None,
         notes: Arc::default(),
         feed: Arc::new(Mutex::new(feed::FeedLog::open(&ws))),
+        keys: crate::KeyStore::file_only(ws.root.join("keys.toml")),
         assets: false,
         decompiled: false,
         usage: None,
@@ -2734,7 +3087,7 @@ fn preparing_the_builders_agent_does_not_lock_up() {
     };
     let (done, finished) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = done.send(w.agent_spec(&ws, &entry, &RunOptions::default()).logs);
+        let _ = done.send(w.agent_spec(&ws, &entry, &RunOptions::default()).unwrap().logs);
     });
     let logs = finished.recv_timeout(std::time::Duration::from_secs(20)).expect("it took the session lock twice and waited on itself");
     assert!(logs.is_some());
@@ -2757,6 +3110,7 @@ fn the_run_answers_the_builders_own_check_during_its_turn() {
         editor: None,
         notes: Arc::default(),
         feed: Arc::new(Mutex::new(feed::FeedLog::open(&ws))),
+        keys: crate::KeyStore::file_only(ws.root.join("keys.toml")),
         assets: false,
         decompiled: false,
         usage: None,
@@ -2764,7 +3118,7 @@ fn the_run_answers_the_builders_own_check_during_its_turn() {
         reset_progress_after_notes: false,
     };
     let mut builder = ChecksItsWork { root: ws.root.clone(), asked: None, reply: None };
-    let reply = w.turn(&mut ws, &mut builder, "Build it.", None).unwrap();
+    let reply = w.turn(&mut ws, &mut builder, "Build it.", true, None).unwrap();
     // The same check the run makes after a turn, as round 0, with what to do next.
     assert!(reply.starts_with("mechanics: failed") && reply.contains("no app/mechanics.json") && reply.contains("check again with rebuild_check"), "{reply}");
     assert!(ws.manifest.checks.is_empty(), "the builder's own check isn't a round");
@@ -2954,6 +3308,7 @@ fn a_note_the_builder_took_at_a_step_joins_the_feed_and_isnt_sent_again() {
             Note { id: 2, text: "add a footer".into(), shown: "add a footer".into(), pictures: Vec::new(), questions: Vec::new() },
         ])),
         feed: Arc::new(Mutex::new(feed::FeedLog::open(&ws))),
+        keys: crate::KeyStore::file_only(ws.root.join("keys.toml")),
         assets: false,
         decompiled: false,
         usage: None,
@@ -2973,7 +3328,7 @@ fn a_note_the_builder_took_at_a_step_joins_the_feed_and_isnt_sent_again() {
     assert_eq!(shown, ["make the header blue"], "it joins the feed as soon as the builder took it");
     assert!(!notes::was_read(&dir, 1), "its files are gone");
     // After the turn, only the note nobody took is sent, and no hook can hand it over again.
-    let (follow, _) = w.added(&mut ws, true).unwrap();
+    let (follow, _) = w.added(&mut ws, true, true).unwrap();
     assert!(follow.contains("add a footer") && !follow.contains("make the header blue"), "{follow}");
     assert!(notes::claim(&dir).is_empty());
 }
@@ -3081,6 +3436,60 @@ fn a_persons_own_project_is_judged_by_its_own_build_and_tests_whatever_its_kind(
     assert_eq!(r.iter().map(|c| c.check.as_str()).collect::<Vec<_>>(), [CheckResult::BUILD, kinds::own::OwnTestsCheck::ID]);
     assert!(r.iter().all(|c| c.passed), "{r:?}");
     assert!(r[1].note.starts_with("No tests ran"), "says what wasn't run: {}", r[1].note);
+}
+
+/// A round of the builder's own checks has a time limit and looks at Pause before each check. A
+/// check that couldn't start is a failed result with the reason, never a silent wait.
+#[test]
+fn a_self_check_round_stops_at_pause_and_at_its_time_limit() {
+    use craft_anything_engine::workspace::ExistingFiles::Edit;
+    let (_d, ws) = own_folder("index.html", Edit);
+    let round = self_check::SELF_CHECK_ROUND;
+    // Past its limit before the first check: that check is reported as not run, and nothing runs.
+    let r = check_worker(&ws, false).run_checks_within(&ws, &GameKind, round, Some(Duration::ZERO)).unwrap();
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert!(!r[0].passed && r[0].note.starts_with("Not run:"), "{r:?}");
+    // Paused: the round ends with the cancelled error before any check starts.
+    let paused = check_worker(&ws, false);
+    paused.stop.cancel();
+    let e = paused.run_checks_within(&ws, &GameKind, round, None).unwrap_err();
+    assert_eq!(e.code, ErrorCode::Cancelled);
+    // With time left, both checks run as they do without a limit.
+    let r = check_worker(&ws, false).run_checks_within(&ws, &GameKind, round, Some(Duration::from_secs(600))).unwrap();
+    assert_eq!(r.len(), 2, "{r:?}");
+    assert!(r.iter().all(|c| c.passed), "{r:?}");
+}
+
+/// Each check is said before it runs, as a step of its own, so a stall names the check it is in.
+/// A real round's lines are Check steps (the feed, the CLI and the progress panel keep their
+/// stage); the builder's own checks belong to its Build turn.
+#[test]
+fn every_check_is_said_before_it_runs_as_its_own_step() {
+    use craft_anything_engine::workspace::ExistingFiles::Edit;
+    let (_d, ws) = own_folder("index.html", Edit);
+    let run_round = |round: u32| {
+        let mut worker = check_worker(&ws, false);
+        let (tx, rx) = std::sync::mpsc::channel();
+        worker.tx = tx;
+        let r = worker.run_checks_within(&ws, &GameKind, round, None).unwrap();
+        let said: Vec<(Step, String)> = rx
+            .try_iter()
+            .filter_map(|e| match e {
+                RunEvent::Step { step, text } => Some((step, text)),
+                _ => None,
+            })
+            .collect();
+        (r, said)
+    };
+    let (r, said) = run_round(1);
+    assert_eq!(r.len(), 2, "{r:?}");
+    assert_eq!(said.len(), 2, "{said:?}");
+    assert!(said.iter().all(|(s, _)| *s == Step::Check), "a real round stays in the Check stage: {said:?}");
+    assert!(said[0].1.contains("Checking the build (1 of 2): build"), "{said:?}");
+    assert!(said[1].1.contains("(2 of 2): own-tests"), "{said:?}");
+    let (_, said) = run_round(self_check::SELF_CHECK_ROUND);
+    assert!(said.iter().all(|(s, _)| *s == Step::Build), "the builder's own checks are part of its turn: {said:?}");
+    assert!(said[0].1.starts_with("Checking its work (1 of 2): build"), "{said:?}");
 }
 
 #[test]
@@ -3258,6 +3667,7 @@ fn a_session_left_on_another_computer_starts_a_new_one_from_the_project() {
         editor: None,
         notes: Arc::default(),
         feed: Arc::new(Mutex::new(feed::FeedLog::open(&ws))),
+        keys: crate::KeyStore::file_only(ws.root.join("keys.toml")),
         assets: false,
         decompiled: false,
         usage: None,
@@ -3265,7 +3675,7 @@ fn a_session_left_on_another_computer_starts_a_new_one_from_the_project() {
         reset_progress_after_notes: false,
     };
     let first = resumed_elsewhere("THE BRIEF", &ws.manifest.last_reply, None);
-    let reply = w.turn(&mut ws, &mut agent, "The person asks: make it blue", Some(first)).unwrap();
+    let reply = w.turn(&mut ws, &mut agent, "The person asks: make it blue", true, Some(first)).unwrap();
     assert_eq!(reply.trim(), "Carried on: yes");
     let sent = std::fs::read_to_string(bin.path().join("claude.last")).unwrap();
     assert!(
@@ -3313,13 +3723,16 @@ fn a_missing_session_with_nothing_to_start_from_is_said_plainly() {
         editor: None,
         notes: Arc::default(),
         feed: Arc::new(Mutex::new(feed::FeedLog::open(&ws))),
+        keys: crate::KeyStore::file_only(ws.root.join("keys.toml")),
         assets: false,
         decompiled: false,
         usage: None,
         self_check: None,
         reset_progress_after_notes: false,
     };
-    let e = w.turn_with_wait(&mut ws, &mut agent, "Carry on.", None, |_, _| panic!("a missing session without a fresh start must not be retried")).unwrap_err();
+    let e = w
+        .turn_with_wait(&mut ws, &mut agent, "Carry on.", true, None, |_, _| panic!("a missing session without a fresh start must not be retried"))
+        .unwrap_err();
     assert!(e.message.contains("isn't on this computer"), "{e:?}");
     assert!(ws.manifest.agent_session.is_none());
 }
@@ -3377,6 +3790,7 @@ fn the_builders_conversation_travels_with_the_project() {
         editor: None,
         notes: Arc::default(),
         feed: Arc::new(Mutex::new(feed::FeedLog::open(&ws))),
+        keys: crate::KeyStore::file_only(ws.root.join("keys.toml")),
         assets: false,
         decompiled: false,
         usage: None,
@@ -3454,6 +3868,7 @@ fn a_build_says_when_it_waits_for_an_analysis_started_earlier() {
         editor: None,
         notes: Arc::default(),
         feed: Arc::new(Mutex::new(feed::FeedLog::open(&ws))),
+        keys: crate::KeyStore::file_only(ws.root.join("keys.toml")),
         assets: false,
         decompiled: false,
         usage: None,
